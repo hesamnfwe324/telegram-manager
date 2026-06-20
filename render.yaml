@@ -7,7 +7,6 @@ services:
     region: frankfurt
     plan: starter
     autoDeploy: true
-    buildCommand: "alembic upgrade head"
 
     envVars:
       - key: TELEGRAM_API_ID
@@ -55,7 +54,6 @@ services:
         value: "6"
       - key: RETRY_MAX_ATTEMPTS
         value: "3"
-      # Optional S3 backup — fill in if needed
       - key: S3_BUCKET
         sync: false
       - key: S3_ENDPOINT
@@ -65,14 +63,15 @@ services:
       - key: S3_SECRET_KEY
         sync: false
 
+  - type: redis
+    name: tg-manager-redis
+    plan: starter
+    region: frankfurt
+    maxmemoryPolicy: noeviction
+
 databases:
   - name: tg-manager-db
     databaseName: tgmanager
     user: tgmanager
-    plan: starter
-    region: frankfurt
-
-  - name: tg-manager-redis
-    type: redis
     plan: starter
     region: frankfurt
