@@ -1,0 +1,143 @@
+"""
+APScheduler-based task scheduler.
+Jobs:
+  - Daily PostgreSQL backup
+  - Auto-retry failed group joins
+  - Daily stats report to admins
+"""
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Any
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+from app.config import settings
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class SchedulerService:
+    _instance: "SchedulerService | None" = None
+
+    def __init__(self) -> None:
+        self._scheduler = AsyncIOScheduler(timezone="UTC")
+        self._bot: Any = None
+
+    @classmethod
+    def get_instance(cls) -> "SchedulerService":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def set_bot(self, bot: Any) -> None:
+        self._bot = bot
+
+    def start(self) -> None:
+        # Daily backup
+        self._scheduler.add_job(
+            self._daily_backup,
+            CronTrigger(hour=settings.BACKUP_DAILY_HOUR, minute=0),
+            id="daily_backup",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+        # Auto-retry failed joins
+        if settings.RETRY_FAILED_JOINS:
+            self._scheduler.add_job(
+                self._retry_failed_joins,
+                IntervalTrigger(hours=settings.RETRY_INTERVAL_HOURS),
+                id="retry_failed_joins",
+                replace_existing=True,
+                misfire_grace_time=600,
+            )
+
+        # Daily stats at 08:00 UTC
+        self._scheduler.add_job(
+            self._daily_stats_report,
+            CronTrigger(hour=8, minute=0),
+            id="daily_stats",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+        self._scheduler.start()
+        logger.info("Scheduler started — %d jobs registered", len(self._scheduler.get_jobs()))
+
+    def stop(self) -> None:
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
+
+    async def _daily_backup(self) -> None:
+        logger.info("Running scheduled daily backup")
+        try:
+            from app.services.backup_service import BackupService
+            svc = BackupService()
+            path = await svc.create_backup(actor="scheduler")
+            if path:
+                from app.services.notification_service import NotificationService
+                await NotificationService.get_instance().notify_info(
+                    f"💾 بکاپ روزانه ساخته شد:\n`{path}`"
+                )
+        except Exception as exc:
+            logger.error("Scheduled backup failed: %s", exc, exc_info=True)
+            from app.services.notification_service import NotificationService
+            await NotificationService.get_instance().notify_critical(
+                "بکاپ روزانه ناموفق", str(exc)[:300]
+            )
+
+    async def _retry_failed_joins(self) -> None:
+        logger.info("Running auto-retry for failed joins")
+        try:
+            from app.database.connection import AsyncSessionLocal
+            from app.repositories import GroupRepository
+            from app.repositories.join_attempt_repository import JoinAttemptRepository
+            from app.models.group import GroupStatus
+            from app.services.join_queue_service import JoinQueueService
+
+            async with AsyncSessionLocal() as session:
+                group_repo = GroupRepository(session)
+                attempt_repo = JoinAttemptRepository(session)
+                failed_groups = await group_repo.get_by_status(GroupStatus.FAILED, limit=100)
+
+                queued = 0
+                for group in failed_groups:
+                    attempts = await attempt_repo.count_for_group(group.group_id)
+                    if attempts < settings.RETRY_MAX_ATTEMPTS and group.invite_link:
+                        jq = JoinQueueService.get_instance()
+                        await jq.enqueue(
+                            group_id=group.group_id,
+                            link=group.invite_link,
+                            title=group.title,
+                            attempt=attempts + 1,
+                        )
+                        queued += 1
+
+            if queued:
+                logger.info("Queued %d failed joins for retry", queued)
+                from app.services.notification_service import NotificationService
+                await NotificationService.get_instance().notify_info(
+                    f"🔄 {queued} گروه ناموفق برای تلاش مجدد در صف قرار گرفت"
+                )
+        except Exception as exc:
+            logger.error("Auto-retry failed: %s", exc, exc_info=True)
+
+    async def _daily_stats_report(self) -> None:
+        try:
+            from app.services.stats_service import StatsService
+            stats = await StatsService().get_stats()
+            from app.services.notification_service import NotificationService
+            ns = NotificationService.get_instance()
+            await ns.notify(
+                "📊 *گزارش روزانه*\n\n"
+                f"👥 کل گروه‌ها: `{stats.total_groups}` | عضو شده: `{stats.joined_groups}`\n"
+                f"🔗 لینک‌های کشف‌شده: `{stats.total_links}`\n"
+                f"👤 کاربران مخاطب: `{stats.total_contacted_users}`\n"
+                f"❌ عضویت ناموفق: `{stats.failed_groups}`"
+            )
+        except Exception as exc:
+            logger.error("Daily stats report failed: %s", exc)
