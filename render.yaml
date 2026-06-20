@@ -68,7 +68,6 @@ services:
       maxmemoryPolicy: noeviction
       ipAllowList:
         - source: 0.0.0.0/0
-          description: everywhere
   databases:
     - name: tg-manager-db
       databaseName: tgmanager
