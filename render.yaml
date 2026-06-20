@@ -7,7 +7,6 @@ services:
       region: frankfurt
       plan: starter
       autoDeploy: true
-
       envVars:
         - key: TELEGRAM_API_ID
           sync: false
@@ -62,14 +61,14 @@ services:
           sync: false
         - key: S3_SECRET_KEY
           sync: false
-
     - type: redis
       name: tg-manager-redis
       plan: starter
       region: frankfurt
       maxmemoryPolicy: noeviction
-      ipAllowList: []
-
+      ipAllowList:
+        - source: 0.0.0.0/0
+          description: everywhere
   databases:
     - name: tg-manager-db
       databaseName: tgmanager
