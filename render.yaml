@@ -1,77 +1,75 @@
 services:
-    - type: worker
-      name: tg-group-manager
-      runtime: docker
-      dockerfilePath: ./Dockerfile
-      dockerContext: .
-      region: frankfurt
-      plan: starter
-      autoDeploy: true
-      envVars:
-        - key: TELEGRAM_API_ID
-          sync: false
-        - key: TELEGRAM_API_HASH
-          sync: false
-        - key: TELEGRAM_PHONE
-          sync: false
-        - key: TELEGRAM_SESSION_STRING
-          sync: false
-        - key: BOT_TOKEN
-          sync: false
-        - key: ADMIN_IDS
-          sync: false
-        - key: DATABASE_URL
-          fromDatabase:
-            name: tg-manager-db
-            property: connectionString
-        - key: REDIS_URL
-          fromService:
-            name: tg-manager-redis
-            type: redis
-            property: connectionString
-        - key: LOG_LEVEL
-          value: INFO
-        - key: LOG_JSON
-          value: "true"
-        - key: APP_ENV
-          value: production
-        - key: BACKUP_DIR
-          value: /tmp/backups
-        - key: BACKUP_KEEP_DAYS
-          value: "7"
-        - key: BACKUP_DAILY_HOUR
-          value: "3"
-        - key: MAX_JOINS_PER_DAY
-          value: "50"
-        - key: JOIN_DELAY_MIN
-          value: "240"
-        - key: JOIN_DELAY_MAX
-          value: "480"
-        - key: RETRY_FAILED_JOINS
-          value: "true"
-        - key: RETRY_INTERVAL_HOURS
-          value: "6"
-        - key: RETRY_MAX_ATTEMPTS
-          value: "3"
-        - key: S3_BUCKET
-          sync: false
-        - key: S3_ENDPOINT
-          sync: false
-        - key: S3_ACCESS_KEY
-          sync: false
-        - key: S3_SECRET_KEY
-          sync: false
-    - type: redis
-      name: tg-manager-redis
-      plan: starter
-      region: frankfurt
-      maxmemoryPolicy: noeviction
-      ipAllowList:
-        - source: 0.0.0.0/0
-  databases:
-    - name: tg-manager-db
-      databaseName: tgmanager
-      user: tgmanager
-      plan: starter
-      region: frankfurt
-  
+  - type: worker
+    name: tg-group-manager
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: frankfurt
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_PHONE
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tg-manager-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: tg-manager-redis
+          type: redis
+          property: connectionString
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+      - key: APP_ENV
+        value: production
+      - key: BACKUP_DIR
+        value: /tmp/backups
+      - key: BACKUP_KEEP_DAYS
+        value: "7"
+      - key: BACKUP_DAILY_HOUR
+        value: "3"
+      - key: MAX_JOINS_PER_DAY
+        value: "50"
+      - key: JOIN_DELAY_MIN
+        value: "240"
+      - key: JOIN_DELAY_MAX
+        value: "480"
+      - key: RETRY_FAILED_JOINS
+        value: "true"
+      - key: RETRY_INTERVAL_HOURS
+        value: "6"
+      - key: RETRY_MAX_ATTEMPTS
+        value: "3"
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+  - type: redis
+    name: tg-manager-redis
+    plan: starter
+    region: frankfurt
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+databases:
+  - name: tg-manager-db
+    databaseName: tgmanager
+    user: tgmanager
+    plan: starter
+    region: frankfurt
