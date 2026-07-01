@@ -1,4 +1,5 @@
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 
@@ -37,6 +38,15 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def _safe_edit(callback: CallbackQuery, text: str, **kwargs) -> None:
+    """Edit message text, silently ignoring 'message is not modified' errors."""
+    try:
+        await callback.message.edit_text(text, **kwargs)  # type: ignore[union-attr]
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
@@ -53,7 +63,7 @@ async def cmd_menu(message: Message) -> None:
 
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("منوی اصلی:", reply_markup=main_menu_keyboard())  # type: ignore[union-attr]
+    await _safe_edit(callback, "منوی اصلی:", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
@@ -71,7 +81,8 @@ async def cb_system_health(callback: CallbackQuery) -> None:
     last_ok = health.last_ok_at()
     last_ok_str = last_ok.strftime("%H:%M:%S UTC") if last_ok else "—"
 
-    await callback.message.edit_text(  # type: ignore[union-attr]
+    await _safe_edit(
+        callback,
         "❤️ <b>وضعیت سیستم</b>\n\n"
         f"📡 User Client: {client_status}\n"
         f"🏥 Health Monitor: {health_status}\n"
@@ -135,7 +146,8 @@ async def cb_error_logs(callback: CallbackQuery) -> None:
         logs = await repo.get_errors(limit=15)
 
     if not logs:
-        await callback.message.edit_text(  # type: ignore[union-attr]
+        await _safe_edit(
+            callback,
             "✅ هیچ خطایی در لاگ‌ها ثبت نشده.",
             reply_markup=back_kb,
         )
@@ -150,7 +162,8 @@ async def cb_error_logs(callback: CallbackQuery) -> None:
             + (f"\n<i>{detail}</i>" if detail else "")
         )
 
-    await callback.message.edit_text(  # type: ignore[union-attr]
+    await _safe_edit(
+        callback,
         "\n\n".join(lines),
         parse_mode="HTML",
         reply_markup=back_kb,
