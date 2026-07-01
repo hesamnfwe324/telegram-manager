@@ -3,6 +3,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
 
+from datetime import datetime, timezone
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +62,50 @@ async def cmd_menu(message: Message) -> None:
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
 
+@router.message(Command("cancel_broadcast"))
+async def cmd_cancel_broadcast(message: Message) -> None:
+    """Cancel the currently running broadcast immediately."""
+    from app.services.broadcast_queue_service import BroadcastQueueService
+    bqs = BroadcastQueueService.get_instance()
+    if not bqs.is_active():
+        await message.answer("⚠️ هیچ broadcast فعالی در حال اجرا نیست.")
+        return
+    cancelled = bqs.cancel_active()
+    if cancelled:
+        await message.answer(
+            "🛑 <b>Broadcast لغو شد.</b>\n\n"
+            "گزارش نهایی با آمار تا الان برایتان ارسال می‌شود.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer("⚠️ تسک اجرایی پیدا نشد — broadcast flag reset شد.")
+
+
+@router.message(Command("broadcast_status"))
+async def cmd_broadcast_status(message: Message) -> None:
+    """Show progress of the currently running broadcast."""
+    from app.services.broadcast_queue_service import BroadcastQueueService
+    bqs = BroadcastQueueService.get_instance()
+    job = bqs.get_active_job()
+    if not job:
+        await message.answer("⚠️ هیچ broadcast فعالی در حال اجرا نیست.")
+        return
+    done = job.success + job.failed
+    pct = int(done / job.total * 100) if job.total else 0
+    target_fa = "گروه‌ها" if job.target == "groups" else "کاربران"
+    elapsed = (datetime.now(timezone.utc) - job.started_at).seconds // 60
+    await message.answer(
+        f"📢 <b>وضعیت broadcast</b>\n\n"
+        f"مقصد: {target_fa}\n"
+        f"پیشرفت: <code>{done}</code> از <code>{job.total}</code> ({pct}%)\n"
+        f"✅ موفق: <code>{job.success}</code>\n"
+        f"❌ ناموفق: <code>{job.failed}</code>\n"
+        f"⏱ مدت: <code>{elapsed}</code> دقیقه\n\n"
+        f"برای لغو: /cancel_broadcast",
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery) -> None:
     await _safe_edit(callback, "منوی اصلی:", reply_markup=main_menu_keyboard())
@@ -71,15 +116,35 @@ async def cb_main_menu(callback: CallbackQuery) -> None:
 async def cb_system_health(callback: CallbackQuery) -> None:
     await callback.answer()
     from app.services import TelegramUserService, HealthService, JoinQueueService
+    from app.services.broadcast_queue_service import BroadcastQueueService
 
     tg = TelegramUserService.get_instance()
     health = HealthService.get_instance()
     jq = JoinQueueService.get_instance()
+    bqs = BroadcastQueueService.get_instance()
 
     client_status = "🟢 متصل" if tg.is_running() else "🔴 قطع"
     health_status = "✅ سالم" if health.is_healthy() else "⚠️ مشکل دارد"
     last_ok = health.last_ok_at()
     last_ok_str = last_ok.strftime("%H:%M:%S UTC") if last_ok else "—"
+
+    # Broadcast status
+    bc_job = bqs.get_active_job()
+    if bc_job:
+        done = bc_job.success + bc_job.failed
+        pct = int(done / bc_job.total * 100) if bc_job.total else 0
+        bc_status = f"📢 در حال ارسال ({done}/{bc_job.total} — {pct}%)"
+    else:
+        bc_status = "💤 بیکار"
+
+    buttons = [
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="system_health")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
+    ]
+    if bc_job:
+        buttons.insert(1, [
+            InlineKeyboardButton(text="🛑 لغو broadcast", callback_data="cancel_broadcast_cb")
+        ])
 
     await _safe_edit(
         callback,
@@ -87,13 +152,23 @@ async def cb_system_health(callback: CallbackQuery) -> None:
         f"📡 User Client: {client_status}\n"
         f"🏥 Health Monitor: {health_status}\n"
         f"⏱ آخرین بررسی OK: <code>{last_ok_str}</code>\n"
-        f"📋 صف عضویت: <code>{jq.queue_size()}</code> مورد در انتظار",
+        f"📋 صف عضویت: <code>{jq.queue_size()}</code> مورد در انتظار\n"
+        f"📢 Broadcast: {bc_status}",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="system_health")],
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+@router.callback_query(F.data == "cancel_broadcast_cb")
+async def cb_cancel_broadcast(callback: CallbackQuery) -> None:
+    from app.services.broadcast_queue_service import BroadcastQueueService
+    bqs = BroadcastQueueService.get_instance()
+    cancelled = bqs.cancel_active()
+    await callback.answer(
+        "🛑 Broadcast لغو شد." if cancelled else "⚠️ تسک پیدا نشد.",
+        show_alert=True,
+    )
+    await cb_system_health(callback)
 
 
 @router.callback_query(F.data == "system_start")
