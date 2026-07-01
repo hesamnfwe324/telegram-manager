@@ -244,3 +244,98 @@ async def cb_retry_all_failed(callback: CallbackQuery) -> None:
         parse_mode="HTML",
         reply_markup=_back_btn(),
     )
+
+
+# ── Admin sends link directly to the bot ──────────────────────────────────────
+
+from aiogram.filters import StateFilter
+from aiogram.fsm.state import default_state
+from aiogram.types import Message
+from app.utils.validators import LinkValidator
+
+
+@router.message(StateFilter(default_state), F.text)
+async def handle_admin_link(message: Message) -> None:
+    """Process Telegram group links sent directly by admin in private chat."""
+    text = message.text or ""
+    links = LinkValidator.extract_links(text)
+
+    if not links:
+        return  # Plain text with no links — ignore
+
+    from app.services import TelegramUserService, JoinQueueService
+
+    tg = TelegramUserService.get_instance()
+    results: list[str] = []
+
+    for raw_link in dict.fromkeys(links):  # deduplicate, preserve order
+        normalized = LinkValidator.normalize(raw_link)
+        if not normalized:
+            results.append(f"❌ لینک نامعتبر: <code>{raw_link}</code>")
+            continue
+
+        if not tg.is_running():
+            results.append(
+                f"⚠️ <b>User Client متصل نیست.</b>\n"
+                f"لینک <code>{normalized}</code> قابل پردازش نیست.\n"
+                f"ابتدا از دکمه «▶️ شروع سیستم» در منو استفاده کنید."
+            )
+            continue
+
+        try:
+            entity = await tg.resolve_entity(normalized)
+            if entity is None:
+                results.append(f"❌ لینک قابل حل نیست: <code>{normalized}</code>")
+                continue
+
+            is_group = await tg.is_group(entity)
+            if not is_group:
+                results.append(f"⚠️ این یک کانال است نه گروه: <code>{normalized}</code>")
+                continue
+
+            group_id: int = entity.id
+            title: str | None = getattr(entity, "title", None)
+            username: str | None = getattr(entity, "username", None)
+            members_count: int | None = getattr(entity, "participants_count", None)
+
+            async with AsyncSessionLocal() as session:
+                group_repo = GroupRepository(session)
+                existing = await group_repo.get_by_group_id(group_id)
+                if existing:
+                    results.append(
+                        f"ℹ️ قبلاً ثبت شده: <b>{title or group_id}</b> — وضعیت: {existing.status.value}"
+                    )
+                    continue
+
+                await group_repo.upsert(
+                    group_id=group_id,
+                    title=title,
+                    username=username.lower() if username else None,
+                    invite_link=normalized,
+                    members_count=members_count,
+                    status=GroupStatus.PENDING,
+                )
+                await session.commit()
+
+            jq = JoinQueueService.get_instance()
+            await jq.enqueue(group_id=group_id, link=normalized, title=title)
+            results.append(
+                f"✅ در صف عضویت: <b>{title or str(group_id)}</b>"
+                + (f" ({members_count:,} عضو)" if members_count else "")
+            )
+            logger.info(
+                "Admin manually queued group %d (%s) via direct link",
+                group_id, title,
+            )
+
+        except Exception as exc:
+            results.append(f"❌ خطا برای <code>{normalized}</code>: {exc}")
+
+    if results:
+        await message.answer(
+            "🔗 <b>نتیجه پردازش لینک:</b>\n\n" + "\n\n".join(results),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 منوی اصلی", callback_data="main_menu")]
+            ]),
+        )
