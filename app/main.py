@@ -45,11 +45,11 @@ async def _check_db() -> None:
 async def _init_db() -> None:
     """Create all tables, migrating stale schema when necessary.
 
-    The schema check uses its own connection so that a failed SELECT does not
+    Uses separate connections so a failed schema-check SELECT does not
     abort the DDL transaction that follows (asyncpg marks a connection as
     failed after any error inside a transaction block).
     """
-    # ── Step 1: check current schema in an isolated connection ──────────────
+    # ── Step 1: probe schema in its own connection ───────────────────────────
     needs_reset = False
     async with engine.connect() as conn:
         try:
@@ -57,31 +57,54 @@ async def _init_db() -> None:
             logger.info("DB schema is current — no migration needed")
         except Exception:
             logger.warning(
-                "Stale DB schema detected (groups.group_id missing) — "
-                "will drop all tables and enum types, then recreate"
+                "Stale DB schema detected — will wipe all public tables "
+                "and enum types, then recreate with current models"
             )
             needs_reset = True
-        # connection is rolled back / closed automatically on exit
+        # connection rolls back / closes automatically
 
-    # ── Step 2: reset if needed ──────────────────────────────────────────────
+    # ── Step 2: nuclear wipe (fresh connection, raw SQL + CASCADE) ───────────
     if needs_reset:
-        # drop tables in a fresh transaction
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-            logger.info("All tables dropped")
+            # Drop ALL tables in public schema (CASCADE handles FK chains)
+            await conn.execute(text("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN (
+                        SELECT tablename
+                        FROM pg_tables
+                        WHERE schemaname = 'public'
+                    ) LOOP
+                        EXECUTE 'DROP TABLE IF EXISTS '
+                            || quote_ident(r.tablename)
+                            || ' CASCADE';
+                    END LOOP;
+                END $$
+            """))
+            logger.info("All public tables dropped (CASCADE)")
 
-        # drop PostgreSQL enum types (not removed by drop_all) in another tx
-        async with engine.begin() as conn:
-            for enum_name in ("group_status", "link_status", "log_level"):
-                try:
-                    await conn.execute(
-                        text(f"DROP TYPE IF EXISTS {enum_name} CASCADE")
-                    )
-                    logger.debug("Dropped enum type %s", enum_name)
-                except Exception as exc:
-                    logger.debug("Could not drop enum %s: %s", enum_name, exc)
+            # Drop all enum types in public schema
+            await conn.execute(text("""
+                DO $$
+                DECLARE r RECORD;
+                BEGIN
+                    FOR r IN (
+                        SELECT t.typname
+                        FROM pg_type t
+                        JOIN pg_namespace n ON n.oid = t.typnamespace
+                        WHERE t.typtype = 'e'
+                          AND n.nspname = 'public'
+                    ) LOOP
+                        EXECUTE 'DROP TYPE IF EXISTS '
+                            || quote_ident(r.typname)
+                            || ' CASCADE';
+                    END LOOP;
+                END $$
+            """))
+            logger.info("All public enum types dropped")
 
-    # ── Step 3: create (or verify) all tables ───────────────────────────────
+    # ── Step 3: create fresh tables ──────────────────────────────────────────
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured")
@@ -235,7 +258,6 @@ async def main() -> None:
     await bot.session.close()
     await engine.dispose()
 
-    # Shut down the HTTP health server
     health_http_server.close()
     await health_http_server.wait_closed()
 
