@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     MAX_JOINS_PER_DAY: int = 50
 
     # Join queue (anti-detection)
-    JOIN_DELAY_MIN: int = 240
-    JOIN_DELAY_MAX: int = 480
+    JOIN_DELAY_MIN: int = 480
+    JOIN_DELAY_MAX: int = 600
 
     # Auto-retry for failed joins
     RETRY_FAILED_JOINS: bool = True
