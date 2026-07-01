@@ -71,4 +71,12 @@ class ContactedUserRepository(BaseRepository[ContactedUser]):
               .where(ContactedUser.is_blocked.is_(False))
           )
           return result.scalar_one()
-    
+
+    async def count_active(self) -> int:
+        """Count only non-blocked users (deactivated/blocked accounts excluded)."""
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(ContactedUser)
+            .where(ContactedUser.is_blocked.is_(False))
+        )
+        return result.scalar_one()
