@@ -241,24 +241,34 @@ class TelegramUserService:
         message_id: int,
         group_link: str | None = None,
     ) -> tuple[bool, str | None]:
-        """Forward a message to a group using the user client.
+        """Copy-send a message to a group using the Telethon user client.
+
+        IMPORTANT: Uses send_message/send_file instead of forward_messages.
+        forward_messages triggers aggressive Telegram FloodWait (hours-long)
+        when used repeatedly; copy-sending has much more lenient limits.
 
         Args:
-            group_id: Telegram group_id stored in DB (may be a placeholder).
-            from_chat_id: Bot username (e.g. '@MyBot') — most reliable way to
-                locate the admin's message in the admin→bot conversation.
+            group_id: Telegram group_id stored in DB.
+            from_chat_id: Bot username (e.g. '@MyBot') — locates the message
+                in the admin→bot conversation.
             message_id: ID of the message the admin sent to the bot.
-            group_link: Invite link or @username for the group (preferred for
-                entity resolution; avoids relying on session cache).
+            group_link: Invite link or @username (preferred for entity resolution).
         """
         try:
-            # 1. Resolve source peer via username — always works without access_hash.
+            # 1. Resolve source peer (the bot) to fetch the original message.
             from_entity = await self.client.get_entity(from_chat_id)
 
-            # 2. Resolve destination group.
-            #    Prefer invite_link / @username because they resolve without a
-            #    cached access_hash.  Fall back to integer group_id only if
-            #    no link is available.
+            # 2. Fetch the original message from admin→bot conversation.
+            msgs = await self.client.get_messages(from_entity, ids=[message_id])
+            if not msgs or msgs[0] is None:
+                logger.error(
+                    "Message %d not found in conversation with %s",
+                    message_id, from_chat_id,
+                )
+                return False, "message_not_found"
+            original = msgs[0]
+
+            # 3. Resolve destination group.
             if group_link:
                 try:
                     dest_entity = await self.client.get_entity(group_link)
@@ -271,20 +281,29 @@ class TelegramUserService:
             else:
                 dest_entity = group_id
 
-            await self.client.forward_messages(
-                entity=dest_entity,
-                messages=message_id,
-                from_peer=from_entity,
-            )
-            return True, None
-        except FloodWaitError as exc:
-            logger.warning("FloodWait forwarding to group %d: wait %d seconds", group_id, exc.seconds)
-            await asyncio.sleep(exc.seconds)
-            return False, "flood_wait"
-        except Exception as exc:
-            logger.error("Failed to forward to group %d: %s", group_id, exc, exc_info=True)
-            return False, str(exc)
+            # 4. Copy-send: send_file for media, send_message for text.
+            #    This avoids the forward_messages rate-limit (FloodWait hours).
+            if original.media:
+                await self.client.send_file(
+                    dest_entity,
+                    original.media,
+                    caption=original.message or "",
+                )
+            else:
+                await self.client.send_message(dest_entity, original.message or "")
 
+            return True, None
+
+        except FloodWaitError as exc:
+            # Never sleep for the full wait — just report it and move on.
+            logger.warning(
+                "FloodWait sending to group %d: wait %d seconds (~%.1fh)",
+                group_id, exc.seconds, exc.seconds / 3600,
+            )
+            return False, f"flood_wait:{exc.seconds}s"
+        except Exception as exc:
+            logger.error("Failed to send to group %d: %s", group_id, exc, exc_info=True)
+            return False, str(exc)
     async def refresh_dialogs(self, limit: int = 50, timeout: float = 12.0) -> None:
         """Refresh Telethon's entity cache with a strict timeout.
 
