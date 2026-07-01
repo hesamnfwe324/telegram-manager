@@ -22,6 +22,12 @@ class GroupRepository(BaseRepository[Group]):
         )
         return result.scalar_one_or_none()
 
+    async def get_by_invite_link(self, invite_link: str) -> Group | None:
+        result = await self._session.execute(
+            select(Group).where(Group.invite_link == invite_link)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_status(self, status: GroupStatus, limit: int = 50) -> list[Group]:
         result = await self._session.execute(
             select(Group)
