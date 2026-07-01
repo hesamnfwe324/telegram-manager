@@ -8,6 +8,7 @@ from .notification_service import NotificationService
 from .health_service import HealthService
 from .broadcast_queue_service import BroadcastQueueService
 from .scheduler_service import SchedulerService
+from .join_approval_service import JoinApprovalWatcher
 
 __all__ = [
     "TelegramUserService",
@@ -20,4 +21,5 @@ __all__ = [
     "HealthService",
     "BroadcastQueueService",
     "SchedulerService",
+    "JoinApprovalWatcher",
 ]
