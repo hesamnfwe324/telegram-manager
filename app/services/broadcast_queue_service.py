@@ -41,6 +41,10 @@ class BroadcastJob:
     message_text: str = ""
     media_file_id: str | None = None
     media_type: str | None = None
+    # Forward-mode fields — set when the admin sent a forwarded message
+    is_forward: bool = False
+    forward_from_chat_id: int | None = None
+    forward_from_message_id: int | None = None
 
 
 class BroadcastQueueService:
@@ -61,6 +65,7 @@ class BroadcastQueueService:
 
     def is_active(self) -> bool:
         return self._active
+
     def cancel_active(self) -> None:
         """Force-reset the active flag (emergency use only).
 
@@ -81,6 +86,9 @@ class BroadcastQueueService:
         message_text: str = "",
         media_file_id: str | None = None,
         media_type: str | None = None,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_from_message_id: int | None = None,
     ) -> str:
         if self._active:
             raise RuntimeError("یک broadcast در حال اجرا است. لطفاً صبر کنید.")
@@ -97,6 +105,9 @@ class BroadcastQueueService:
             message_text=message_text,
             media_file_id=media_file_id,
             media_type=media_type,
+            is_forward=is_forward,
+            forward_from_chat_id=forward_from_chat_id,
+            forward_from_message_id=forward_from_message_id,
         )
         self._jobs[job_id] = job
         asyncio.create_task(self._run(job), name=f"broadcast-{job_id}")
@@ -106,7 +117,6 @@ class BroadcastQueueService:
         """Remove oldest completed jobs to prevent unbounded memory growth."""
         done_jobs = [(jid, j) for jid, j in self._jobs.items() if j.done]
         if len(done_jobs) > MAX_STORED_JOBS:
-            # Sort by started_at ascending, remove oldest excess entries
             done_jobs.sort(key=lambda x: x[1].started_at)
             for jid, _ in done_jobs[:len(done_jobs) - MAX_STORED_JOBS]:
                 del self._jobs[jid]
@@ -140,8 +150,6 @@ class BroadcastQueueService:
         tg = TelegramUserService.get_instance()
 
         # Refresh entity cache so recently-joined groups are resolvable.
-        # With StringSession after a restart, the in-memory entity cache is
-        # cleared; get_dialogs() reloads it from Telegram.
         await tg.refresh_dialogs()
 
         async with AsyncSessionLocal() as session:
@@ -151,16 +159,7 @@ class BroadcastQueueService:
         job.total = len(groups)
         actor = str(job.actor_id)
 
-        # Resolve bot via username (always works, no access_hash needed).
-        # The admin's message lives in the admin→bot private conversation,
-        # identified by the bot's username from Telethon's perspective.
-        bot_me = await job.bot.get_me()
-        bot_peer = f"@{bot_me.username}"
-
         for group in groups:
-            # Prefer invite_link or @username so Telethon resolves the entity
-            # without relying on the session cache (which may not include groups
-            # joined after the session string was generated).
             group_link = group.invite_link or (
                 f"@{group.username}" if group.username else None
             )
@@ -170,8 +169,10 @@ class BroadcastQueueService:
                 message_text=job.message_text,
                 media_file_id=job.media_file_id,
                 media_type=job.media_type,
-                fallback_from_peer=bot_peer,
-                fallback_message_id=job.message_id,
+                is_forward=job.is_forward,
+                forward_from_chat_id=job.forward_from_chat_id,
+                forward_from_message_id=job.forward_from_message_id,
+                bot=job.bot,
             )
             if ok:
                 job.success += 1
@@ -195,11 +196,29 @@ class BroadcastQueueService:
         actor = str(job.actor_id)
 
         for user in users:
-            ok, reason = await tg.forward_message_to_user(
-                user_id=user.user_id,
-                from_chat_id=job.from_chat_id,
-                message_id=job.message_id,
-            )
+            # For user DMs: if it's a forward with full origin info, forward from source.
+            # Otherwise fall back to the existing forward_message_to_user path.
+            if job.is_forward and job.forward_from_chat_id and job.forward_from_message_id:
+                ok, reason = await tg.forward_message_to_user(
+                    user_id=user.user_id,
+                    from_chat_id=job.forward_from_chat_id,
+                    message_id=job.forward_from_message_id,
+                )
+            elif job.media_file_id and job.media_type:
+                ok, reason = await tg.send_media_to_user(
+                    user_id=user.user_id,
+                    media_file_id=job.media_file_id,
+                    media_type=job.media_type,
+                    caption=job.message_text,
+                    bot=job.bot,
+                )
+            else:
+                ok, reason = await tg.forward_message_to_user(
+                    user_id=user.user_id,
+                    from_chat_id=job.from_chat_id,
+                    message_id=job.message_id,
+                )
+
             if ok:
                 job.success += 1
                 await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
@@ -210,9 +229,6 @@ class BroadcastQueueService:
                     await self._mark_user_blocked(user.user_id, is_deactivated=False)
                 elif reason == "deactivated":
                     job.deactivated += 1
-                    # Mark deactivated users as blocked so we stop DMing them.
-                    # is_blocked=True is intentional: deactivated accounts can never
-                    # receive messages, so they must be excluded from future sends.
                     await self._mark_user_blocked(user.user_id, is_deactivated=True)
                 await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
             await asyncio.sleep(DM_DELAY)
