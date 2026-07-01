@@ -29,11 +29,11 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DM_DELAY = 3          # seconds between DMs (Bot API limit: 1 msg/s per chat)
+DM_DELAY = 0.5        # seconds between DMs — 0.5s is safe under Bot API 30/s global limit
 GROUP_DELAY = 2       # seconds between group sends
 MAX_STORED_JOBS = 50
 PER_CALL_TIMEOUT = 60 # max seconds for a single Telethon call (prevents FloodWait hang)
-PROGRESS_EVERY = 50   # send progress update every N users
+PROGRESS_EVERY = 25   # edit progress message every N users
 
 _MAX_BROADCAST_SECONDS: int = 3600
 
@@ -62,6 +62,7 @@ class BroadcastJob:
     is_forward: bool = False
     forward_from_chat_id: int | None = None
     forward_from_message_id: int | None = None
+    progress_message_id: int | None = None  # ID of the single live-edited progress message
 
 
 class BroadcastQueueService:
@@ -218,7 +219,7 @@ class BroadcastQueueService:
 
         except TelegramBadRequest as exc:
             msg = str(exc).lower()
-            if "chat not found" in msg or "user not found" in msg:
+            if "chat not found" in msg or "user not found" in msg or "deactivated" in msg:
                 return False, "deactivated"
             if "bot was blocked" in msg:
                 return False, "blocked"
@@ -261,38 +262,58 @@ class BroadcastQueueService:
             await bot.send_document(**kw, document=file_id)
 
     async def _send_to_users(self, job: BroadcastJob) -> None:
-        async with AsyncSessionLocal() as session:
-            repo = ContactedUserRepository(session)
-            users = await repo.get_active(limit=10000)
+          async with AsyncSessionLocal() as session:
+              repo = ContactedUserRepository(session)
+              users = await repo.get_active(limit=10000)
 
-        job.total = len(users)
-        actor = str(job.actor_id)
-        logger.info("Broadcast job %s: sending to %d users via Bot API", job.job_id, job.total)
+          job.total = len(users)
+          actor = str(job.actor_id)
+          logger.info("Broadcast job %s: sending to %d users via Bot API", job.job_id, job.total)
 
-        for idx, user in enumerate(users):
-            ok, reason = await self._bot_send_to_user(job, user.user_id)
+          if not users:
+              logger.info("Broadcast job %s: no active users to send to", job.job_id)
+              return
 
-            if ok:
-                job.success += 1
-                await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
-            else:
-                job.failed += 1
-                if job.first_user_error is None:
-                    job.first_user_error = f"uid={user.user_id}: {reason}"
-                if reason == "blocked":
-                    job.blocked += 1
-                    await self._mark_user_blocked(user.user_id)
-                elif reason == "deactivated":
-                    job.deactivated += 1
-                    await self._mark_user_blocked(user.user_id)
-                await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+          # Send ONE initial progress message — all updates EDIT this single message
+          try:
+              prog_msg = await job.bot.send_message(
+                  job.actor_id,
+                  f"⏳ <b>ارسال همگانی شروع شد</b>\n\n"
+                  f"📦 کاربران فعال: <code>{job.total}</code>\n"
+                  f"در حال ارسال...",
+                  parse_mode="HTML",
+              )
+              job.progress_message_id = prog_msg.message_id
+          except Exception as exc:
+              logger.warning("Could not send initial progress message: %s", exc)
 
-            done_count = idx + 1
-            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
-                await self._send_progress(job, done_count)
+          for idx, user in enumerate(users):
+              ok, reason = await self._bot_send_to_user(job, user.user_id)
 
-            await asyncio.sleep(DM_DELAY)
+              if ok:
+                  job.success += 1
+                  await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
+              else:
+                  job.failed += 1
+                  if job.first_user_error is None:
+                      job.first_user_error = f"uid={user.user_id}: {reason}"
+                  if reason == "blocked":
+                      job.blocked += 1
+                      await self._mark_user_blocked(user.user_id)
+                  elif reason in ("deactivated", "migrated"):
+                      job.deactivated += 1
+                      await self._mark_user_blocked(user.user_id)
+                  await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
 
+              done_count = idx + 1
+              if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
+                  await self._send_progress(job, done_count)
+
+              # Fast-fail cases (blocked/deactivated) need minimal delay
+              if reason in ("blocked", "deactivated", "migrated"):
+                  await asyncio.sleep(0.05)
+              else:
+                  await asyncio.sleep(DM_DELAY)
     # ══════════════════════════════════════════════════════════════════
     # GROUP BROADCAST — uses Telethon (user-client is a member)
     # ══════════════════════════════════════════════════════════════════
@@ -353,17 +374,27 @@ class BroadcastQueueService:
     # ══════════════════════════════════════════════════════════════════
 
     async def _send_progress(self, job: BroadcastJob, done: int) -> None:
-        try:
-            pct = int(done / job.total * 100)
-            await job.bot.send_message(
-                job.actor_id,
-                f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
-                f"✅ {job.success} موفق / ❌ {job.failed} ناموفق / 📦 {done} از {job.total}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
+          """Edit the single live-progress message instead of flooding new ones."""
+          try:
+              pct = int(done / job.total * 100) if job.total else 0
+              text = (
+                  f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
+                  f"✅ موفق: <code>{job.success}</code>\n"
+                  f"❌ ناموفق: <code>{job.failed}</code>\n"
+                  f"📦 {done} از {job.total}"
+              )
+              if job.progress_message_id:
+                  await job.bot.edit_message_text(
+                      chat_id=job.actor_id,
+                      message_id=job.progress_message_id,
+                      text=text,
+                      parse_mode="HTML",
+                  )
+              else:
+                  msg = await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+                  job.progress_message_id = msg.message_id
+          except Exception:
+              pass
     async def _mark_user_blocked(self, user_id: int) -> None:
         try:
             async with AsyncSessionLocal() as s:
@@ -414,8 +445,20 @@ class BroadcastQueueService:
             if job.first_group_error:
                 text += f"\n\n🔍 اولین خطای گروه: <code>{job.first_group_error[:200]}</code>"
 
-            await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
-            for admin_id in settings.get_admin_id_list():
+            # Edit the live-progress message with the final result
+              if job.progress_message_id:
+                  try:
+                      await job.bot.edit_message_text(
+                          chat_id=job.actor_id,
+                          message_id=job.progress_message_id,
+                          text=text,
+                          parse_mode="HTML",
+                      )
+                  except Exception:
+                      await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+              else:
+                  await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+              for admin_id in settings.get_admin_id_list():
                 if admin_id != job.actor_id:
                     try:
                         await job.bot.send_message(admin_id, text, parse_mode="HTML")
