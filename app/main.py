@@ -1,4 +1,5 @@
 import asyncio
+import os
 import signal
 import sys
 
@@ -53,7 +54,6 @@ async def _build_storage():
         try:
             from aiogram.fsm.storage.redis import RedisStorage
             storage = RedisStorage.from_url(settings.REDIS_URL)
-            # Test the connection before committing to Redis
             await storage.redis.ping()
             logger.info("Redis FSM storage connected: %s", settings.REDIS_URL.split("@")[-1])
             return storage
@@ -66,8 +66,47 @@ async def _build_storage():
                 exc,
             )
     from aiogram.fsm.storage.memory import MemoryStorage
-    logger.warning("Using in-memory FSM storage — states lost on restart. Set a reachable REDIS_URL for production.")
+    logger.warning(
+        "Using in-memory FSM storage — states lost on restart. "
+        "Set a reachable REDIS_URL for production."
+    )
     return MemoryStorage()
+
+
+async def _http_health_handler(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    """Respond to any HTTP request with 200 OK — used by Render health checks."""
+    try:
+        await asyncio.wait_for(reader.read(4096), timeout=5.0)
+    except Exception:
+        pass
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        b"OK"
+    )
+    try:
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def _start_health_server() -> asyncio.Server:
+    """Start a minimal HTTP server so Render web service health checks pass."""
+    port = int(os.getenv("PORT", "10000"))
+    server = await asyncio.start_server(
+        _http_health_handler, "0.0.0.0", port
+    )
+    logger.info("Health server listening on port %d", port)
+    return server
 
 
 async def main() -> None:
@@ -84,6 +123,9 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_shutdown, loop)
 
+    # Start HTTP health server first so Render marks the service healthy immediately
+    health_http_server = await _start_health_server()
+
     await _check_db()
     await _init_db()
 
@@ -98,7 +140,6 @@ async def main() -> None:
     dp.message.middleware(AdminAuthMiddleware())
     dp.callback_query.middleware(AdminAuthMiddleware())
 
-    # Wire up singleton services
     ns = NotificationService.get_instance()
     ns.set_bot(bot)
 
@@ -112,7 +153,6 @@ async def main() -> None:
     scheduler = SchedulerService.get_instance()
     scheduler.set_bot(bot)
 
-    # Start user client (non-fatal if session not yet configured)
     async def _start_client_safe() -> None:
         try:
             await tg.start()
@@ -155,6 +195,11 @@ async def main() -> None:
     await tg.stop()
     await bot.session.close()
     await engine.dispose()
+
+    # Shut down the HTTP health server
+    health_http_server.close()
+    await health_http_server.wait_closed()
+
     logger.info("Shutdown complete")
 
 
