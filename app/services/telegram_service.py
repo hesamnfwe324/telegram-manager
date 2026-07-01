@@ -1,8 +1,9 @@
 import asyncio
+import re
 from typing import Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat, User, ChatInvite, ChatInviteAlready
 from telethon.errors import (
     FloodWaitError,
     UserAlreadyParticipantError,
@@ -15,6 +16,10 @@ from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_PRIVATE_INVITE_RE = re.compile(
+    r"t\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)", re.I
+)
 
 
 class TelegramUserService:
@@ -65,14 +70,65 @@ class TelegramUserService:
         return self._running and self.client.is_connected()
 
     async def resolve_entity(self, link: str) -> Any | None:
+        """Resolve a Telegram link to an entity.
+        Supports both public username links and private invite links.
+        """
         try:
+            m = _PRIVATE_INVITE_RE.search(link)
+            if m:
+                invite_hash = m.group(1)
+                try:
+                    from telethon.tl.functions.messages import CheckChatInviteRequest
+                    result = await self.client(CheckChatInviteRequest(invite_hash))
+                    return result  # ChatInvite or ChatInviteAlready
+                except Exception as exc:
+                    logger.debug("CheckChatInviteRequest failed for %s: %s", link, exc)
+                    return None
             return await self.client.get_entity(link)
         except Exception as exc:
             logger.debug("Cannot resolve entity %s: %s", link, exc)
             return None
 
     async def is_group(self, entity: Any) -> bool:
+        """Return True if the entity is a group (not a broadcast channel)."""
+        if isinstance(entity, ChatInviteAlready):
+            chat = getattr(entity, "chat", None)
+            if chat:
+                return isinstance(chat, (Chat, Channel)) and not getattr(chat, "broadcast", False)
+            return False
+        if isinstance(entity, ChatInvite):
+            # Valid group/supergroup invite — broadcast=False means it's a group
+            return not getattr(entity, "broadcast", False)
         return isinstance(entity, (Chat, Channel)) and not getattr(entity, "broadcast", False)
+
+    async def get_entity_info(
+        self, entity: Any
+    ) -> tuple[int | None, str | None, str | None, int | None]:
+        """Extract (group_id, title, username, members_count) from any resolved entity type."""
+        if isinstance(entity, ChatInviteAlready):
+            chat = getattr(entity, "chat", None)
+            if chat:
+                return (
+                    chat.id,
+                    getattr(chat, "title", None),
+                    getattr(chat, "username", None),
+                    getattr(chat, "participants_count", None),
+                )
+            return None, None, None, None
+        if isinstance(entity, ChatInvite):
+            # Private invite not yet joined — group_id unknown until we actually join
+            return (
+                None,
+                getattr(entity, "title", None),
+                None,
+                getattr(entity, "participants_count", None),
+            )
+        return (
+            getattr(entity, "id", None),
+            getattr(entity, "title", None),
+            getattr(entity, "username", None),
+            getattr(entity, "participants_count", None),
+        )
 
     async def get_user_bio(self, user_id: int) -> str:
         try:
@@ -85,22 +141,43 @@ class TelegramUserService:
             pass
         return ""
 
-    async def join_group(self, link: str) -> bool:
+    async def join_group(self, link: str) -> tuple[bool, int | None]:
+        """
+        Join a group by invite link or public username.
+
+        Returns (success, real_group_id).
+        - For private invite links the real group_id is extracted from the join
+          response so callers can update any placeholder record.
+        - For public links the entity is resolved first and its id returned.
+        """
         try:
-            from telethon.tl.functions.channels import JoinChannelRequest
-            await self.client(JoinChannelRequest(link))
-            logger.info("Joined group: %s", link)
-            return True
+            m = _PRIVATE_INVITE_RE.search(link)
+            if m:
+                invite_hash = m.group(1)
+                from telethon.tl.functions.messages import ImportChatInviteRequest
+                updates = await self.client(ImportChatInviteRequest(invite_hash))
+                real_id: int | None = None
+                if hasattr(updates, "chats") and updates.chats:
+                    real_id = updates.chats[0].id
+                logger.info("Joined private group via invite: %s (group_id=%s)", link, real_id)
+                return True, real_id
+            else:
+                from telethon.tl.functions.channels import JoinChannelRequest
+                entity = await self.client.get_entity(link)
+                await self.client(JoinChannelRequest(entity))
+                real_id = getattr(entity, "id", None)
+                logger.info("Joined public group: %s (group_id=%s)", link, real_id)
+                return True, real_id
         except UserAlreadyParticipantError:
             logger.info("Already in group: %s", link)
-            return True
+            return True, None
         except FloodWaitError as exc:
             logger.warning("FloodWait joining %s: wait %d seconds", link, exc.seconds)
             await asyncio.sleep(exc.seconds)
-            return False
+            return False, None
         except Exception as exc:
             logger.error("Failed to join %s: %s", link, exc)
-            return False
+            return False, None
 
     async def send_message_to_group(self, group_id: int, message: Any) -> bool:
         try:
