@@ -20,6 +20,7 @@ from app.services import (
     NotificationService,
     HealthService,
     SchedulerService,
+    JoinApprovalWatcher,
 )
 
 logger = get_logger(__name__)
@@ -213,6 +214,9 @@ async def main() -> None:
     health.set_tg_service(tg)
     health.set_join_queue(jq)   # enables worker-crash watchdog
 
+    approval_watcher = JoinApprovalWatcher.get_instance()
+    approval_watcher.set_tg_service(tg)
+
     scheduler = SchedulerService.get_instance()
     scheduler.set_bot(bot)
 
@@ -221,9 +225,10 @@ async def main() -> None:
             await tg.start()
             discovery = DiscoveryService(tg)
             tg.on_new_message(discovery.process_message)
+            await approval_watcher.start()   # watch for approved join requests
             await jq.start()
             await health.start()
-            logger.info("User client, join queue, and health monitor started")
+            logger.info("User client, join queue, approval watcher, and health monitor started")
         except RuntimeError as exc:
             logger.error("User client startup failed: %s", exc)
             await ns.notify_critical("User Client ناموفق", str(exc)[:300])
