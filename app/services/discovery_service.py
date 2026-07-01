@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,12 @@ from app.utils.validators import LinkValidator
 logger = get_logger(__name__)
 
 
+def _placeholder_group_id(link: str) -> int:
+    """Stable negative placeholder ID for private invite links before joining."""
+    h = int(hashlib.md5(link.encode()).hexdigest()[:10], 16) % (10 ** 9)
+    return -h
+
+
 class DiscoveryService:
     def __init__(self, tg_service: Any) -> None:
         self._tg = tg_service
@@ -22,11 +29,9 @@ class DiscoveryService:
             text = event.message.text or ""
             sender_id = event.sender_id
 
-            # Track sender as contacted user
             if sender_id and sender_id > 0:
                 await self._track_user(event)
 
-            # Keyword filter — if configured, skip messages without any keyword
             keywords = settings.get_discovery_keywords()
             if keywords:
                 text_lower = text.lower()
@@ -35,7 +40,6 @@ class DiscoveryService:
 
             links = LinkValidator.extract_links(text)
 
-            # Also check sender bio
             if sender_id:
                 try:
                     bio = await self._tg.get_user_bio(sender_id)
@@ -90,11 +94,9 @@ class DiscoveryService:
             await log_repo.add(action="link_discovered", result="success", target=link, details=f"source={source}")
             await session.commit()
 
-        # Validate and enqueue outside the session so we open a fresh connection
         await self._validate_and_enqueue(link)
 
     async def _validate_and_enqueue(self, link: str) -> None:
-        # Resolve the entity via Telegram API (may be slow — done outside any DB session)
         entity = await self._tg.resolve_entity(link)
 
         async with AsyncSessionLocal() as session:
@@ -102,7 +104,6 @@ class DiscoveryService:
             group_repo = GroupRepository(session)
             log_repo = LogRepository(session)
 
-            # Re-fetch the link record we just inserted
             record = await link_repo.get_by_link(link)
             if not record:
                 return
@@ -110,7 +111,10 @@ class DiscoveryService:
             if entity is None:
                 record.status = LinkStatus.REJECTED
                 record.notes = "Could not resolve entity"
-                await log_repo.add(action="link_validation_failed", result="error", target=link, details="entity not found")
+                await log_repo.add(
+                    action="link_validation_failed", result="error",
+                    target=link, details="entity not found",
+                )
                 await session.commit()
                 return
 
@@ -123,17 +127,30 @@ class DiscoveryService:
                 logger.info("Link %s is a channel — skipping", link)
                 return
 
-            group_id: int = entity.id
-            title: str | None = getattr(entity, "title", None)
-            username: str | None = getattr(entity, "username", None)
-            members_count: int | None = getattr(entity, "participants_count", None)
+            # get_entity_info handles ChatInvite / ChatInviteAlready / regular entities
+            group_id, title, username, members_count = await self._tg.get_entity_info(entity)
 
+            # For private invite links not yet joined, group_id is None —
+            # use a placeholder so we can track the record.
+            if group_id is None:
+                group_id = _placeholder_group_id(link)
+
+            # Check for duplicate by real group_id
             existing = await group_repo.get_by_group_id(group_id)
             if existing is not None:
                 record.status = LinkStatus.REJECTED
                 record.notes = f"Duplicate group_id={group_id}"
                 await session.commit()
                 logger.debug("Duplicate group %d — skipping", group_id)
+                return
+
+            # Also check by invite link to avoid re-queuing the same private link
+            existing_by_link = await group_repo.get_by_invite_link(link)
+            if existing_by_link is not None:
+                record.status = LinkStatus.REJECTED
+                record.notes = "Duplicate invite_link"
+                await session.commit()
+                logger.debug("Duplicate invite_link %s — skipping", link)
                 return
 
             await group_repo.upsert(
@@ -152,7 +169,6 @@ class DiscoveryService:
             await session.commit()
             logger.info("Registered group %d (%s) — enqueueing for join", group_id, title)
 
-        # Push to join queue (sequential, jittered)
         from app.services.join_queue_service import JoinQueueService
         jq = JoinQueueService.get_instance()
         await jq.enqueue(group_id=group_id, link=link, title=title)
