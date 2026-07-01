@@ -212,7 +212,7 @@ class JoinQueueService:
         )
         await asyncio.sleep(delay)
 
-        success, real_group_id = await self._tg.join_group(task.link)
+        success, real_group_id, join_error = await self._tg.join_group(task.link)
 
         async with AsyncSessionLocal() as session:
             group_repo = GroupRepository(session)
@@ -240,7 +240,7 @@ class JoinQueueService:
                 invite_link=task.link,
                 attempt_number=task.attempt_number,
                 success=success,
-                error=None if success else "join_failed",
+                error=join_error,
             )
 
             if group:
