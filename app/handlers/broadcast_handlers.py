@@ -73,7 +73,37 @@ async def cancel_bc(message: Message, state: FSMContext) -> None:
 
 @router.message(BroadcastStates.waiting_content)
 async def receive_content(message: Message, state: FSMContext) -> None:
-    await state.update_data(from_chat_id=message.chat.id, message_id=message.message_id)
+    # Store content at receive time — avoids Bot API vs MTProto message_id mismatch.
+    # (In private chats, Bot API IDs differ from MTProto IDs; we can't use one to
+    # look up messages via the other.)
+    media_file_id: str | None = None
+    media_type: str | None = None
+    if message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.video:
+        media_file_id = message.video.file_id
+        media_type = "video"
+    elif message.document:
+        media_file_id = message.document.file_id
+        media_type = "document"
+    elif message.audio:
+        media_file_id = message.audio.file_id
+        media_type = "audio"
+    elif message.voice:
+        media_file_id = message.voice.file_id
+        media_type = "voice"
+    elif message.sticker:
+        media_file_id = message.sticker.file_id
+        media_type = "sticker"
+
+    await state.update_data(
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+        message_text=message.text or message.caption or "",
+        media_file_id=media_file_id,
+        media_type=media_type,
+    )
     data = await state.get_data()
     target = data.get("target", "groups")
     label = "گروه‌ها" if target == "groups" else "کاربران"
@@ -123,6 +153,9 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             message_id=data["message_id"],
             actor_id=actor_id,
             bot=callback.bot,
+            message_text=data.get("message_text", ""),
+            media_file_id=data.get("media_file_id"),
+            media_type=data.get("media_type"),
         )
         await callback.message.edit_text(  # type: ignore[union-attr]
             f"✅ <b>ارسال همگانی شروع شد</b> (job: <code>{job_id}</code>)\n\n"
