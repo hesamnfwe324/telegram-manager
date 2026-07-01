@@ -1,3 +1,4 @@
+SHA: 1aa9f677e11c8116f754a7647eb7d15a5c3c0da5
 import asyncio
 import re
 from io import BytesIO
@@ -8,6 +9,7 @@ from telethon.tl.types import Channel, Chat, User, ChatInvite, ChatInviteAlready
 from telethon.errors import (
     FloodWaitError,
     UserAlreadyParticipantError,
+    InviteRequestSentError,
     UserIsBlockedError,
     InputUserDeactivatedError,
     PeerFloodError,
@@ -217,6 +219,13 @@ class TelegramUserService:
         except UserAlreadyParticipantError:
             logger.info("Already in group: %s", link)
             return True, None, None
+        except InviteRequestSentError:
+            # Group requires admin approval before entry.
+            # The join REQUEST was successfully submitted — this is NOT a failure.
+            # Status will be set to JOINED in DB so we don't retry endlessly;
+            # the account will be admitted once the admin approves.
+            logger.info("Join request sent (pending admin approval): %s", link)
+            return True, None, "request_pending_approval"
         except FloodWaitError as exc:
             logger.warning("FloodWait joining %s: wait %d seconds", link, exc.seconds)
             await asyncio.sleep(exc.seconds)
