@@ -211,6 +211,7 @@ async def main() -> None:
 
     health = HealthService.get_instance()
     health.set_tg_service(tg)
+    health.set_join_queue(jq)   # enables worker-crash watchdog
 
     scheduler = SchedulerService.get_instance()
     scheduler.set_bot(bot)
