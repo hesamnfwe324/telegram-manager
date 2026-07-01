@@ -1,5 +1,8 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    MessageOriginChannel, MessageOriginChat,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -73,9 +76,28 @@ async def cancel_bc(message: Message, state: FSMContext) -> None:
 
 @router.message(BroadcastStates.waiting_content)
 async def receive_content(message: Message, state: FSMContext) -> None:
-    # Store content at receive time — avoids Bot API vs MTProto message_id mismatch.
-    # (In private chats, Bot API IDs differ from MTProto IDs; we can't use one to
-    # look up messages via the other.)
+    # --- Detect forwarded messages and capture original source ---
+    # When a message is forwarded from a channel/group, we store the ORIGINAL
+    # chat_id and message_id so Telethon can forward from the real source
+    # (preserving the "Forwarded from …" header) rather than re-sending as text.
+    is_forward: bool = False
+    forward_from_chat_id: int | None = None
+    forward_from_message_id: int | None = None
+
+    if message.forward_origin is not None:
+        is_forward = True
+        origin = message.forward_origin
+        # Channel or linked supergroup — has both chat.id and message_id
+        if isinstance(origin, MessageOriginChannel):
+            forward_from_chat_id = origin.chat.id
+            forward_from_message_id = origin.message_id
+        # Chat (group/supergroup) forwarded as a message — may have sender_chat
+        elif isinstance(origin, MessageOriginChat):
+            forward_from_chat_id = origin.sender_chat.id
+            # MessageOriginChat does NOT expose the original message_id
+            # so we fall back to downloading media or sending text.
+
+    # --- Extract media file_id from direct sends (non-forward or forward with media) ---
     media_file_id: str | None = None
     media_type: str | None = None
     if message.photo:
@@ -96,6 +118,12 @@ async def receive_content(message: Message, state: FSMContext) -> None:
     elif message.sticker:
         media_file_id = message.sticker.file_id
         media_type = "sticker"
+    elif message.video_note:
+        media_file_id = message.video_note.file_id
+        media_type = "video_note"
+    elif message.animation:
+        media_file_id = message.animation.file_id
+        media_type = "animation"
 
     await state.update_data(
         from_chat_id=message.chat.id,
@@ -103,6 +131,9 @@ async def receive_content(message: Message, state: FSMContext) -> None:
         message_text=message.text or message.caption or "",
         media_file_id=media_file_id,
         media_type=media_type,
+        is_forward=is_forward,
+        forward_from_chat_id=forward_from_chat_id,
+        forward_from_message_id=forward_from_message_id,
     )
     data = await state.get_data()
     target = data.get("target", "groups")
@@ -115,9 +146,22 @@ async def receive_content(message: Message, state: FSMContext) -> None:
             users = await ContactedUserRepository(session).get_active(limit=100000)
             count = len(users)
 
+    # Build a human-readable description of what will be sent
+    if is_forward and forward_from_chat_id and forward_from_message_id:
+        content_desc = "📨 <b>فوروارد</b> از منبع اصلی"
+    elif is_forward:
+        content_desc = "📨 <b>فوروارد</b> (با محتوای پیام)"
+    elif media_type:
+        content_desc = f"🖼 <b>{media_type}</b>"
+        if message.caption:
+            content_desc += f" + کپشن"
+    else:
+        content_desc = "✍️ <b>متن</b>"
+
     await state.set_state(BroadcastStates.confirming)
     await message.answer(
         f"📋 <b>پیش‌نمایش پیام بالا</b>\n\n"
+        f"نوع محتوا: {content_desc}\n"
         f"مقصد: <b>{label}</b>\n"
         f"تعداد: <b>{count}</b>\n\n"
         "⚠️ ارسال در پس‌زمینه اجرا می‌شود — ربات همچنان پاسخگو می‌ماند.\n"
@@ -156,6 +200,9 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext) -> None:
             message_text=data.get("message_text", ""),
             media_file_id=data.get("media_file_id"),
             media_type=data.get("media_type"),
+            is_forward=data.get("is_forward", False),
+            forward_from_chat_id=data.get("forward_from_chat_id"),
+            forward_from_message_id=data.get("forward_from_message_id"),
         )
         await callback.message.edit_text(  # type: ignore[union-attr]
             f"✅ <b>ارسال همگانی شروع شد</b> (job: <code>{job_id}</code>)\n\n"
