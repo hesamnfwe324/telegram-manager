@@ -119,15 +119,16 @@ class BroadcastQueueService:
         job.total = len(groups)
         actor = str(job.actor_id)
 
-        # Use bot's own Telegram user_id as source peer so Telethon can locate
-        # the message in the admin→bot private conversation.
+        # Resolve bot via username (always works, no access_hash needed).
+        # The admin's message lives in the admin→bot private conversation,
+        # identified by the bot's username from Telethon's perspective.
         bot_me = await job.bot.get_me()
-        bot_id = bot_me.id
+        bot_peer = f"@{bot_me.username}"
 
         for group in groups:
             ok, reason = await tg.forward_message_to_group(
                 group_id=group.group_id,
-                from_chat_id=bot_id,
+                from_chat_id=bot_peer,
                 message_id=job.message_id,
             )
             if ok:
