@@ -43,27 +43,46 @@ async def _check_db() -> None:
 
 
 async def _init_db() -> None:
-    """Create all tables — migrating stale schema if needed."""
-    async with engine.begin() as conn:
-        # Check if the groups table has the current schema.
-        # If the column is missing the table was created by an older version;
-        # drop everything and let create_all rebuild with the correct schema.
+    """Create all tables, migrating stale schema when necessary.
+
+    The schema check uses its own connection so that a failed SELECT does not
+    abort the DDL transaction that follows (asyncpg marks a connection as
+    failed after any error inside a transaction block).
+    """
+    # ── Step 1: check current schema in an isolated connection ──────────────
+    needs_reset = False
+    async with engine.connect() as conn:
         try:
             await conn.execute(text("SELECT group_id FROM groups LIMIT 0"))
             logger.info("DB schema is current — no migration needed")
         except Exception:
             logger.warning(
                 "Stale DB schema detected (groups.group_id missing) — "
-                "dropping all tables and enum types before recreating"
+                "will drop all tables and enum types, then recreate"
             )
+            needs_reset = True
+        # connection is rolled back / closed automatically on exit
+
+    # ── Step 2: reset if needed ──────────────────────────────────────────────
+    if needs_reset:
+        # drop tables in a fresh transaction
+        async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.drop_all)
-            # PostgreSQL enum types are not dropped by drop_all — remove them manually
+            logger.info("All tables dropped")
+
+        # drop PostgreSQL enum types (not removed by drop_all) in another tx
+        async with engine.begin() as conn:
             for enum_name in ("group_status", "link_status", "log_level"):
                 try:
-                    await conn.execute(text(f"DROP TYPE IF EXISTS {enum_name} CASCADE"))
-                except Exception as e:
-                    logger.debug("Could not drop enum %s: %s", enum_name, e)
+                    await conn.execute(
+                        text(f"DROP TYPE IF EXISTS {enum_name} CASCADE")
+                    )
+                    logger.debug("Dropped enum type %s", enum_name)
+                except Exception as exc:
+                    logger.debug("Could not drop enum %s: %s", enum_name, exc)
 
+    # ── Step 3: create (or verify) all tables ───────────────────────────────
+    async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured")
 
