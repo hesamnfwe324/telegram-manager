@@ -58,6 +58,15 @@ class BroadcastQueueService:
 
     def is_active(self) -> bool:
         return self._active
+    def cancel_active(self) -> None:
+        """Force-reset the active flag (emergency use only).
+
+        Does not stop any running task — it only unblocks the 'in progress'
+        guard so a new broadcast can start.  The running coroutine will
+        eventually time-out on its own via _MAX_BROADCAST_SECONDS.
+        """
+        self._active = False
+        logger.warning("BroadcastQueueService: active flag force-reset by admin")
 
     async def start_broadcast(
         self,
@@ -93,13 +102,21 @@ class BroadcastQueueService:
             for jid, _ in done_jobs[:len(done_jobs) - MAX_STORED_JOBS]:
                 del self._jobs[jid]
 
+    # Hard ceiling so a stuck broadcast cannot block the queue forever.
+    _MAX_BROADCAST_SECONDS: int = 300  # 5 minutes
+
     async def _run(self, job: BroadcastJob) -> None:
         self._active = True
         try:
-            if job.target == "groups":
-                await self._send_to_groups(job)
-            else:
-                await self._send_to_users(job)
+            coro = (
+                self._send_to_groups(job)
+                if job.target == "groups"
+                else self._send_to_users(job)
+            )
+            await asyncio.wait_for(coro, timeout=self._MAX_BROADCAST_SECONDS)
+        except asyncio.TimeoutError:
+            job.error = f"broadcast timed out after {self._MAX_BROADCAST_SECONDS}s"
+            logger.error("Broadcast job %s timed out", job.job_id)
         except Exception as exc:
             job.error = str(exc)
             logger.error("Broadcast job %s failed: %s", job.job_id, exc, exc_info=True)
