@@ -285,18 +285,26 @@ class TelegramUserService:
             logger.error("Failed to forward to group %d: %s", group_id, exc, exc_info=True)
             return False, str(exc)
 
-    async def refresh_dialogs(self, limit: int = 200) -> None:
-        """Refresh Telethon's entity cache by loading recent dialogs.
+    async def refresh_dialogs(self, limit: int = 50, timeout: float = 12.0) -> None:
+        """Refresh Telethon's entity cache with a strict timeout.
 
-        Must be called before bulk forwarding operations so that recently-joined
-        groups are resolvable by integer ID.  Uses limit=200 to cover typical
-        account sizes without being too slow.
+        get_dialogs() can hang indefinitely on slow connections or overloaded
+        accounts.  We wrap it with asyncio.wait_for so that a broadcast job
+        is never stuck forever waiting for this prefetch to complete.
         """
         try:
-            await self.client.get_dialogs(limit=limit)
+            await asyncio.wait_for(
+                self.client.get_dialogs(limit=limit),
+                timeout=timeout,
+            )
             logger.info("Entity cache refreshed via get_dialogs(limit=%d)", limit)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "refresh_dialogs timed out after %.0fs — proceeding without full cache",
+                timeout,
+            )
         except Exception as exc:
-            logger.warning("refresh_dialogs failed: %s — forwarding may miss cached entities", exc)
+            logger.warning("refresh_dialogs failed: %s — proceeding anyway", exc)
 
     def on_new_message(self, handler: Any) -> None:
         self.client.add_event_handler(handler, events.NewMessage())
