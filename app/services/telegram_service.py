@@ -28,6 +28,48 @@ _PRIVATE_INVITE_RE = re.compile(
 # Media types that support a caption field in Telethon send_file
 _CAPTIONABLE = {"photo", "video", "document", "audio", "animation"}
 
+# Maps media_type → file extension so Telethon knows HOW to send the file.
+# Without a proper extension on BytesIO.name, Telethon always sends as document.
+_MEDIA_EXT: dict[str, str] = {
+    "photo":      ".jpg",
+    "video":      ".mp4",
+    "animation":  ".mp4",   # GIFs stored as MP4 on Telegram
+    "audio":      ".mp3",
+    "voice":      ".ogg",
+    "document":   ".bin",   # let Telegram keep whatever type it is
+    "sticker":    ".webp",
+    "video_note": ".mp4",
+}
+
+
+def _name_bio(bio: BytesIO, media_type: str) -> BytesIO:
+    """Stamp a .name on a BytesIO so Telethon sends it with the right media type.
+
+    Telethon inspects the file extension to decide between photo/video/document.
+    A BytesIO without .name is always sent as a raw document — so stamping
+    '.jpg' for photos is the minimal fix that makes Telethon treat it as an image.
+    """
+    ext = _MEDIA_EXT.get(media_type, ".bin")
+    bio.name = f"media{ext}"
+    bio.seek(0)
+    return bio
+
+
+def _send_file_kwargs(bio: BytesIO, media_type: str, caption: str = "") -> dict[str, Any]:
+    """Build the kwargs dict for client.send_file() with correct flags per type."""
+    bio = _name_bio(bio, media_type)
+    kwargs: dict[str, Any] = {"file": bio}
+    if media_type in _CAPTIONABLE and caption:
+        kwargs["caption"] = caption
+    # Photos must NOT be forced to document — explicit for clarity
+    if media_type == "photo":
+        kwargs["force_document"] = False
+    elif media_type == "voice":
+        kwargs["voice_note"] = True
+    elif media_type == "video_note":
+        kwargs["video_note"] = True
+    return kwargs
+
 
 class TelegramUserService:
     _instance: "TelegramUserService | None" = None
@@ -250,14 +292,7 @@ class TelegramUserService:
             bio = await self._download_bot_file(media_file_id, bot)
             if bio is None:
                 return False, "download_failed"
-            kwargs: dict[str, Any] = {"file": bio}
-            if media_type in _CAPTIONABLE and caption:
-                kwargs["caption"] = caption
-            if media_type == "voice":
-                kwargs["voice_note"] = True
-            elif media_type == "video_note":
-                kwargs["video_note"] = True
-            await self.client.send_file(user_id, **kwargs)
+            await self.client.send_file(user_id, **_send_file_kwargs(bio, media_type, caption))
             return True, None
         except UserIsBlockedError:
             return False, "blocked"
@@ -344,14 +379,10 @@ class TelegramUserService:
                 bio = await self._download_bot_file(media_file_id, bot)
                 if bio is not None:
                     try:
-                        kwargs: dict[str, Any] = {"file": bio}
-                        if media_type in _CAPTIONABLE and message_text:
-                            kwargs["caption"] = message_text
-                        if media_type == "voice":
-                            kwargs["voice_note"] = True
-                        elif media_type == "video_note":
-                            kwargs["video_note"] = True
-                        await self.client.send_file(dest_entity, **kwargs)
+                        await self.client.send_file(
+                            dest_entity,
+                            **_send_file_kwargs(bio, media_type, message_text),
+                        )
                         return True, None
                     except Exception as media_exc:
                         logger.warning(
