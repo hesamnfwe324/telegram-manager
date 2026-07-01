@@ -19,7 +19,8 @@ class SystemStats:
     total_links: int
     pending_links: int
     total_logs: int
-    total_contacted_users: int
+    total_contacted_users: int  # active (non-blocked) only
+    total_contacted_users_all: int  # includes blocked/deactivated
     join_queue_size: int
     client_healthy: bool
     last_activity: datetime | None
@@ -42,7 +43,8 @@ class StatsService:
             total_links = await link_repo.count()
             pending_links = await link_repo.count_by_status(LinkStatus.PENDING)
             total_logs = await log_repo.count()
-            total_contacted_users = await user_repo.count()
+            total_contacted_users = await user_repo.count_active()
+            total_contacted_users_all = await user_repo.count()
             last_log = await log_repo.get_last_activity()
             last_activity = last_log.timestamp if last_log else None
             latest_groups = await group_repo.get_latest(1)
@@ -66,6 +68,7 @@ class StatsService:
             pending_links=pending_links,
             total_logs=total_logs,
             total_contacted_users=total_contacted_users,
+            total_contacted_users_all=total_contacted_users_all,
             join_queue_size=join_queue_size,
             client_healthy=client_healthy,
             last_activity=last_activity,
