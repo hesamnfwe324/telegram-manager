@@ -88,9 +88,11 @@ class JoinQueueService:
                 self._queue.task_done()
 
     async def _process(self, task: JoinTask) -> None:
-        # Fail fast: check TelegramUserService before doing anything
         if self._tg is None:
-            logger.error("TelegramUserService not set on JoinQueueService — dropping task for group_id=%d", task.group_id)
+            logger.error(
+                "TelegramUserService not set on JoinQueueService — dropping task for group_id=%d",
+                task.group_id,
+            )
             return
 
         # Check daily rate limit
@@ -101,11 +103,9 @@ class JoinQueueService:
         if today_count >= settings.MAX_JOINS_PER_DAY:
             logger.warning(
                 "Daily join limit (%d) reached — requeueing group_id=%d for later",
-                settings.MAX_JOINS_PER_DAY, task.group_id,
+                settings.MAX_JOINS_PER_DAY,
+                task.group_id,
             )
-            # Re-enqueue at end of queue and pause the worker for a long interval.
-            # Sleeping BEFORE re-enqueue ensures we don't spin through the entire
-            # queue only to re-enqueue every task back immediately.
             await asyncio.sleep(300)
             await self._queue.put(task)
             return
@@ -114,21 +114,43 @@ class JoinQueueService:
         delay = random.uniform(settings.JOIN_DELAY_MIN, settings.JOIN_DELAY_MAX)
         logger.info(
             "Waiting %.0fs before joining group_id=%d (%r)",
-            delay, task.group_id, task.title,
+            delay,
+            task.group_id,
+            task.title,
         )
         await asyncio.sleep(delay)
 
-        success = await self._tg.join_group(task.link)
+        # join_group now returns (success, real_group_id)
+        success, real_group_id = await self._tg.join_group(task.link)
 
         async with AsyncSessionLocal() as session:
             group_repo = GroupRepository(session)
             log_repo = LogRepository(session)
             attempt_repo = JoinAttemptRepository(session)
 
+            # Look up group by task.group_id (may be a placeholder for private invite links)
             group = await group_repo.get_by_group_id(task.group_id)
 
+            # If we learned the real group_id after joining (private invite link),
+            # update the placeholder record so the DB reflects the actual Telegram ID.
+            if success and real_group_id and real_group_id != task.group_id:
+                existing_real = await group_repo.get_by_group_id(real_group_id)
+                if existing_real is None and group is not None:
+                    try:
+                        group.group_id = real_group_id
+                        await session.flush()
+                        logger.info(
+                            "Updated placeholder group_id %d → real group_id %d",
+                            task.group_id,
+                            real_group_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not update placeholder group_id: %s", exc
+                        )
+
             await attempt_repo.add(
-                group_id=task.group_id,
+                group_id=real_group_id or task.group_id,
                 invite_link=task.link,
                 attempt_number=task.attempt_number,
                 success=success,
@@ -143,22 +165,31 @@ class JoinQueueService:
                         action="group_joined",
                         result="success",
                         target=task.link,
-                        details=f"group_id={task.group_id} title={task.title!r} attempt={task.attempt_number}",
+                        details=(
+                            f"group_id={real_group_id or task.group_id} "
+                            f"title={task.title!r} attempt={task.attempt_number}"
+                        ),
                     )
-                    logger.info("✅ Joined group_id=%d (%r)", task.group_id, task.title)
+                    logger.info(
+                        "✅ Joined group_id=%d (%r)", real_group_id or task.group_id, task.title
+                    )
                 else:
                     group.status = GroupStatus.FAILED
                     await log_repo.add(
                         action="group_join_failed",
                         result="error",
                         target=task.link,
-                        details=f"group_id={task.group_id} title={task.title!r} attempt={task.attempt_number}",
+                        details=(
+                            f"group_id={task.group_id} "
+                            f"title={task.title!r} attempt={task.attempt_number}"
+                        ),
                     )
-                    logger.warning("❌ Failed to join group_id=%d (%r)", task.group_id, task.title)
+                    logger.warning(
+                        "❌ Failed to join group_id=%d (%r)", task.group_id, task.title
+                    )
 
             await session.commit()
 
-        # Notify admins
         if settings.get_admin_id_list():
             await self._notify_admins(task, success)
 
