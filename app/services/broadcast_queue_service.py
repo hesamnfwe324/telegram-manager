@@ -109,6 +109,9 @@ class BroadcastQueueService:
             await self._report(job)
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+
         async with AsyncSessionLocal() as session:
             repo = GroupRepository(session)
             groups = await repo.get_joined()
@@ -116,18 +119,23 @@ class BroadcastQueueService:
         job.total = len(groups)
         actor = str(job.actor_id)
 
+        # Use bot's own Telegram user_id as source peer so Telethon can locate
+        # the message in the admin→bot private conversation.
+        bot_me = await job.bot.get_me()
+        bot_id = bot_me.id
+
         for group in groups:
-            try:
-                await job.bot.forward_message(
-                    chat_id=group.group_id,
-                    from_chat_id=job.from_chat_id,
-                    message_id=job.message_id,
-                )
+            ok, reason = await tg.forward_message_to_group(
+                group_id=group.group_id,
+                from_chat_id=bot_id,
+                message_id=job.message_id,
+            )
+            if ok:
                 job.success += 1
                 await self._log("broadcast_group_sent", "success", actor, str(group.group_id))
-            except Exception as exc:
+            else:
                 job.failed += 1
-                await self._log("broadcast_group_failed", "error", actor, str(group.group_id), str(exc))
+                await self._log("broadcast_group_failed", "error", actor, str(group.group_id), reason)
             await asyncio.sleep(GROUP_DELAY)
 
     async def _send_to_users(self, job: BroadcastJob) -> None:
