@@ -285,6 +285,19 @@ class TelegramUserService:
             logger.error("Failed to forward to group %d: %s", group_id, exc, exc_info=True)
             return False, str(exc)
 
+    async def refresh_dialogs(self, limit: int = 200) -> None:
+        """Refresh Telethon's entity cache by loading recent dialogs.
+
+        Must be called before bulk forwarding operations so that recently-joined
+        groups are resolvable by integer ID.  Uses limit=200 to cover typical
+        account sizes without being too slow.
+        """
+        try:
+            await self.client.get_dialogs(limit=limit)
+            logger.info("Entity cache refreshed via get_dialogs(limit=%d)", limit)
+        except Exception as exc:
+            logger.warning("refresh_dialogs failed: %s — forwarding may miss cached entities", exc)
+
     def on_new_message(self, handler: Any) -> None:
         self.client.add_event_handler(handler, events.NewMessage())
 
