@@ -188,11 +188,13 @@ class TelegramUserService:
             pass
         return ""
 
-    async def join_group(self, link: str) -> tuple[bool, int | None]:
+    async def join_group(self, link: str) -> tuple[bool, int | None, str | None]:
         """
         Join a group by invite link or public username.
 
-        Returns (success, real_group_id).
+        Returns (success, real_group_id, error_message).
+        error_message is the exact Telethon exception type + text so callers
+        can store it in the DB for later diagnosis.
         """
         try:
             m = _PRIVATE_INVITE_RE.search(link)
@@ -204,24 +206,25 @@ class TelegramUserService:
                 if hasattr(updates, "chats") and updates.chats:
                     real_id = updates.chats[0].id
                 logger.info("Joined private group via invite: %s (group_id=%s)", link, real_id)
-                return True, real_id
+                return True, real_id, None
             else:
                 from telethon.tl.functions.channels import JoinChannelRequest
                 entity = await self.client.get_entity(link)
                 await self.client(JoinChannelRequest(entity))
                 real_id = getattr(entity, "id", None)
                 logger.info("Joined public group: %s (group_id=%s)", link, real_id)
-                return True, real_id
+                return True, real_id, None
         except UserAlreadyParticipantError:
             logger.info("Already in group: %s", link)
-            return True, None
+            return True, None, None
         except FloodWaitError as exc:
             logger.warning("FloodWait joining %s: wait %d seconds", link, exc.seconds)
             await asyncio.sleep(exc.seconds)
-            return False, None
+            return False, None, f"FloodWaitError:{exc.seconds}s"
         except Exception as exc:
-            logger.error("Failed to join %s: %s", link, exc)
-            return False, None
+            err = f"{type(exc).__name__}: {exc}"
+            logger.error("Failed to join %s: %s", link, err)
+            return False, None, err
 
     async def send_message_to_group(self, group_id: int, message: Any) -> bool:
         try:
