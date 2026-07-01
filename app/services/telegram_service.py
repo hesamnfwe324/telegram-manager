@@ -446,6 +446,46 @@ class TelegramUserService:
             logger.warning("Failed to download file_id %s via Bot API: %s", file_id, exc)
             return None
 
+    async def keep_online(self) -> None:
+        """Set account presence to online in Telegram.
+
+        Telegram marks accounts offline after ~5 minutes of API inactivity.
+        Call this periodically (every 60s is fine) to stay visible as online.
+        Failures are non-fatal — a debug log is sufficient.
+        """
+        try:
+            from telethon.tl.functions.account import UpdateStatusRequest
+            await asyncio.wait_for(
+                self.client(UpdateStatusRequest(offline=False)),
+                timeout=10.0,
+            )
+        except Exception as exc:
+            logger.debug("keep_online: non-critical failure: %s", exc)
+
+    async def reconnect(self) -> None:
+        """Re-establish connection after an unexpected disconnect.
+
+        Telethon's auto_reconnect handles TCP-level drops, but if the
+        asyncio connection object itself is gone (e.g., Render network blip
+        lasting longer than the keepalive window), we need to call connect()
+        again manually.
+        """
+        try:
+            if not self.client.is_connected():
+                logger.info("User client disconnected — reconnecting …")
+                await self.client.connect()
+
+            if not await self.client.is_user_authorized():
+                logger.error("Session not authorized after reconnect — cannot recover automatically")
+                self._running = False
+                return
+
+            self._running = True
+            logger.info("User client reconnected successfully")
+        except Exception as exc:
+            logger.error("Reconnect attempt failed: %s", exc)
+            self._running = False
+
     async def refresh_dialogs(self, limit: int = 50, timeout: float = 12.0) -> None:
         """Refresh Telethon's entity cache with a strict timeout."""
         try:
