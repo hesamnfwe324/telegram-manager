@@ -234,6 +234,20 @@ class TelegramUserService:
         except Exception as exc:
             logger.error("Failed to forward to %d: %s", user_id, exc)
             return False, str(exc)
+    async def forward_message_to_group(
+        self, group_id: int, from_chat_id: int, message_id: int
+    ) -> tuple[bool, str | None]:
+        """Forward a message to a group using the user client. Returns (success, error_reason)."""
+        try:
+            await self.client.forward_messages(group_id, message_id, from_chat_id)
+            return True, None
+        except FloodWaitError as exc:
+            logger.warning("FloodWait forwarding to group %d: wait %d seconds", group_id, exc.seconds)
+            await asyncio.sleep(exc.seconds)
+            return False, "flood_wait"
+        except Exception as exc:
+            logger.error("Failed to forward to group %d: %s", group_id, exc)
+            return False, str(exc)
 
     def on_new_message(self, handler: Any) -> None:
         self.client.add_event_handler(handler, events.NewMessage())
