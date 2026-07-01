@@ -11,17 +11,17 @@ from typing import Any
 from app.config import settings
 from app.database.connection import AsyncSessionLocal
 from app.repositories import GroupRepository, ContactedUserRepository, LogRepository
-from app.models.group import GroupStatus
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DM_DELAY = 5        # seconds between DMs
-GROUP_DELAY = 2     # seconds between group sends
-MAX_STORED_JOBS = 50   # keep only last N completed jobs to prevent memory leak
+DM_DELAY = 5          # seconds between DMs
+GROUP_DELAY = 2       # seconds between group sends
+MAX_STORED_JOBS = 50  # keep only last N completed jobs
+PER_CALL_TIMEOUT = 90 # max seconds for a single Telethon send call (prevents FloodWait hang)
+PROGRESS_EVERY = 50   # send a progress update to admin every N users
 
-# Hard ceiling so a stuck broadcast cannot block the queue forever.
-# 1 hour is generous enough for 700+ users (5s each) or 1800+ groups (2s each).
+# Hard ceiling — 1 hour gives room for 700+ users even with retries.
 _MAX_BROADCAST_SECONDS: int = 3600
 
 
@@ -45,7 +45,6 @@ class BroadcastJob:
     message_text: str = ""
     media_file_id: str | None = None
     media_type: str | None = None
-    # Forward-mode fields — set when the admin sent a forwarded message
     is_forward: bool = False
     forward_from_chat_id: int | None = None
     forward_from_message_id: int | None = None
@@ -57,6 +56,7 @@ class BroadcastQueueService:
     def __init__(self) -> None:
         self._jobs: dict[str, BroadcastJob] = {}
         self._active: bool = False
+        self._task: asyncio.Task | None = None  # reference for real cancellation
 
     @classmethod
     def get_instance(cls) -> "BroadcastQueueService":
@@ -70,15 +70,25 @@ class BroadcastQueueService:
     def is_active(self) -> bool:
         return self._active
 
-    def cancel_active(self) -> None:
-        """Force-reset the active flag (emergency use only).
+    def get_active_job(self) -> BroadcastJob | None:
+        """Return the currently running job, or None."""
+        for job in self._jobs.values():
+            if not job.done:
+                return job
+        return None
 
-        Does not stop any running task — it only unblocks the 'in progress'
-        guard so a new broadcast can start.  The running coroutine will
-        eventually time-out on its own via _MAX_BROADCAST_SECONDS.
+    def cancel_active(self) -> bool:
+        """Cancel the running broadcast task immediately.
+
+        Returns True if a task was found and cancelled, False if nothing was running.
         """
+        if self._task and not self._task.done():
+            self._task.cancel()
+            logger.warning("BroadcastQueueService: active task cancelled by admin")
+            return True
+        # No running task — just reset the flag
         self._active = False
-        logger.warning("BroadcastQueueService: active flag force-reset by admin")
+        return False
 
     async def start_broadcast(
         self,
@@ -114,11 +124,10 @@ class BroadcastQueueService:
             forward_from_message_id=forward_from_message_id,
         )
         self._jobs[job_id] = job
-        asyncio.create_task(self._run(job), name=f"broadcast-{job_id}")
+        self._task = asyncio.create_task(self._run(job), name=f"broadcast-{job_id}")
         return job_id
 
     def _prune_old_jobs(self) -> None:
-        """Remove oldest completed jobs to prevent unbounded memory growth."""
         done_jobs = [(jid, j) for jid, j in self._jobs.items() if j.done]
         if len(done_jobs) > MAX_STORED_JOBS:
             done_jobs.sort(key=lambda x: x[1].started_at)
@@ -134,6 +143,9 @@ class BroadcastQueueService:
                 else self._send_to_users(job)
             )
             await asyncio.wait_for(coro, timeout=_MAX_BROADCAST_SECONDS)
+        except asyncio.CancelledError:
+            job.error = "cancelled by admin"
+            logger.warning("Broadcast job %s was cancelled", job.job_id)
         except asyncio.TimeoutError:
             job.error = f"broadcast timed out after {_MAX_BROADCAST_SECONDS}s"
             logger.error("Broadcast job %s timed out", job.job_id)
@@ -143,15 +155,29 @@ class BroadcastQueueService:
         finally:
             job.done = True
             self._active = False
+            self._task = None
             self._prune_old_jobs()
             await self._report(job)
+
+    async def _safe_call(self, coro) -> tuple[bool, str | None]:
+        """Wrap a Telethon call with a per-call timeout.
+
+        Prevents a single FloodWait (potentially hours long) from freezing the
+        entire broadcast loop.  If the call takes longer than PER_CALL_TIMEOUT
+        seconds, we cancel it and mark that user/group as 'timeout' failure.
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=PER_CALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("Telethon call timed out after %ds", PER_CALL_TIMEOUT)
+            return False, "per_call_timeout"
+        except asyncio.CancelledError:
+            raise  # propagate cancellation so _run() can handle it
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
         from app.services.telegram_service import TelegramUserService
         tg = TelegramUserService.get_instance()
 
-        # Refresh entity cache so recently-joined groups are resolvable.
-        # Limit 500 so groups beyond the first 50 dialogs are included.
         await tg.refresh_dialogs(limit=500)
 
         async with AsyncSessionLocal() as session:
@@ -165,16 +191,18 @@ class BroadcastQueueService:
             group_link = group.invite_link or (
                 f"@{group.username}" if group.username else None
             )
-            ok, reason = await tg.forward_message_to_group(
-                group_id=group.group_id,
-                group_link=group_link,
-                message_text=job.message_text,
-                media_file_id=job.media_file_id,
-                media_type=job.media_type,
-                is_forward=job.is_forward,
-                forward_from_chat_id=job.forward_from_chat_id,
-                forward_from_message_id=job.forward_from_message_id,
-                bot=job.bot,
+            ok, reason = await self._safe_call(
+                tg.forward_message_to_group(
+                    group_id=group.group_id,
+                    group_link=group_link,
+                    message_text=job.message_text,
+                    media_file_id=job.media_file_id,
+                    media_type=job.media_type,
+                    is_forward=job.is_forward,
+                    forward_from_chat_id=job.forward_from_chat_id,
+                    forward_from_message_id=job.forward_from_message_id,
+                    bot=job.bot,
+                )
             )
             if ok:
                 job.success += 1
@@ -197,49 +225,48 @@ class BroadcastQueueService:
         job.total = len(users)
         actor = str(job.actor_id)
 
-        for user in users:
-            ok: bool
-            reason: str | None
-
-            # ── Priority 1: True forward — original chat + message_id available ──────
-            # Use Telethon forward_messages so "Forwarded from …" header is preserved.
+        for idx, user in enumerate(users):
+            # ── Priority 1: True forward — original chat + message_id ────────────────
             if job.is_forward and job.forward_from_chat_id and job.forward_from_message_id:
-                ok, reason = await tg.forward_message_to_user(
-                    user_id=user.user_id,
-                    from_chat_id=job.forward_from_chat_id,
-                    message_id=job.forward_from_message_id,
+                ok, reason = await self._safe_call(
+                    tg.forward_message_to_user(
+                        user_id=user.user_id,
+                        from_chat_id=job.forward_from_chat_id,
+                        message_id=job.forward_from_message_id,
+                    )
                 )
 
-            # ── Priority 2: Media — download via Bot API and re-upload ───────────────
-            # Bot API file_ids cannot be used by Telethon directly.
+            # ── Priority 2: Media ─────────────────────────────────────────────────────
             elif job.media_file_id and job.media_type:
-                ok, reason = await tg.send_media_to_user(
-                    user_id=user.user_id,
-                    media_file_id=job.media_file_id,
-                    media_type=job.media_type,
-                    caption=job.message_text,
-                    bot=job.bot,
+                ok, reason = await self._safe_call(
+                    tg.send_media_to_user(
+                        user_id=user.user_id,
+                        media_file_id=job.media_file_id,
+                        media_type=job.media_type,
+                        caption=job.message_text,
+                        bot=job.bot,
+                    )
                 )
 
-            # ── Priority 3: Plain text — send directly via Telethon ──────────────────
-            # CRITICAL FIX: Do NOT forward from from_chat_id (bot's private chat) here
-            # because the Telethon user client cannot access bot private chat messages.
-            # Use send_message_to_user instead which sends via the user account directly.
+            # ── Priority 3: Plain text ────────────────────────────────────────────────
+            # CRITICAL: Do NOT use forward_message_to_user here — Telethon user client
+            # cannot access the bot's private chat to forward from it.
             elif job.message_text:
-                ok, reason = await tg.send_message_to_user(
-                    user_id=user.user_id,
-                    message=job.message_text,
+                ok, reason = await self._safe_call(
+                    tg.send_message_to_user(
+                        user_id=user.user_id,
+                        message=job.message_text,
+                    )
                 )
 
-            # ── Priority 4: Last resort — forward from original bot message ──────────
-            # Reached only when is_forward=True but forward_from_message_id is missing
-            # (e.g. forwarded from a group where Telegram hides the origin message_id).
-            # Telethon may or may not have access to from_chat_id; failure is expected.
+            # ── Priority 4: Last resort forward ──────────────────────────────────────
             else:
-                ok, reason = await tg.forward_message_to_user(
-                    user_id=user.user_id,
-                    from_chat_id=job.from_chat_id,
-                    message_id=job.message_id,
+                ok, reason = await self._safe_call(
+                    tg.forward_message_to_user(
+                        user_id=user.user_id,
+                        from_chat_id=job.from_chat_id,
+                        message_id=job.message_id,
+                    )
                 )
 
             if ok:
@@ -249,15 +276,31 @@ class BroadcastQueueService:
                 job.failed += 1
                 if reason == "blocked":
                     job.blocked += 1
-                    await self._mark_user_blocked(user.user_id, is_deactivated=False)
+                    await self._mark_user_blocked(user.user_id)
                 elif reason == "deactivated":
                     job.deactivated += 1
-                    await self._mark_user_blocked(user.user_id, is_deactivated=True)
+                    await self._mark_user_blocked(user.user_id)
                 await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+
+            # Periodic progress report every PROGRESS_EVERY users
+            done_count = idx + 1
+            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
+                await self._send_progress(job, done_count)
+
             await asyncio.sleep(DM_DELAY)
 
-    async def _mark_user_blocked(self, user_id: int, is_deactivated: bool) -> None:
-        """Mark a user as blocked to exclude them from future broadcasts."""
+    async def _send_progress(self, job: BroadcastJob, done: int) -> None:
+        try:
+            pct = int(done / job.total * 100)
+            text = (
+                f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
+                f"✅ {job.success} / ❌ {job.failed} / 📦 {done} از {job.total}"
+            )
+            await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+    async def _mark_user_blocked(self, user_id: int) -> None:
         try:
             async with AsyncSessionLocal() as s:
                 from app.repositories import ContactedUserRepository as CUR
@@ -267,7 +310,7 @@ class BroadcastQueueService:
                     u.is_blocked = True
                 await s.commit()
         except Exception as exc:
-            logger.warning("Failed to mark user %d as blocked (deactivated=%s): %s", user_id, is_deactivated, exc)
+            logger.warning("Failed to mark user %d blocked: %s", user_id, exc)
 
     async def _log(
         self, action: str, result: str, actor: str,
@@ -284,7 +327,13 @@ class BroadcastQueueService:
     async def _report(self, job: BroadcastJob) -> None:
         try:
             target_fa = "گروه‌ها" if job.target == "groups" else "کاربران"
-            status = "✅ کامل شد" if not job.error else "❌ با خطا متوقف شد"
+            if job.error == "cancelled by admin":
+                status = "🛑 لغو شد"
+            elif job.error:
+                status = "❌ با خطا متوقف شد"
+            else:
+                status = "✅ کامل شد"
+
             text = (
                 f"📢 <b>ارسال همگانی {status}</b>\n\n"
                 f"مقصد: {target_fa}\n"
@@ -300,7 +349,6 @@ class BroadcastQueueService:
                 text += f"\n\n🔍 خطای گروه: <code>{job.first_group_error[:300]}</code>"
 
             await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
-
             for admin_id in settings.get_admin_id_list():
                 if admin_id != job.actor_id:
                     try:
