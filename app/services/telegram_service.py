@@ -235,7 +235,7 @@ class TelegramUserService:
             logger.error("Failed to forward to %d: %s", user_id, exc)
             return False, str(exc)
     async def forward_message_to_group(
-        self, group_id: int, from_chat_id: int, message_id: int
+        self, group_id: int, from_chat_id: int | str, message_id: int
     ) -> tuple[bool, str | None]:
         """Forward a message to a group using the user client. Returns (success, error_reason).
         
