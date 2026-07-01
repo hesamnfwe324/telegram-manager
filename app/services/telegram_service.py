@@ -1,5 +1,3 @@
-TS_SHA: e85bf5eae7c6475f36ed5f4f08c850da3ce6b398
-SHA: 1aa9f677e11c8116f754a7647eb7d15a5c3c0da5
 import asyncio
 import re
 from io import BytesIO
