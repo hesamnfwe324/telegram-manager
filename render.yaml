@@ -44,9 +44,9 @@ services:
       - key: MAX_JOINS_PER_DAY
         value: "50"
       - key: JOIN_DELAY_MIN
-        value: "240"
+        value: "420"
       - key: JOIN_DELAY_MAX
-        value: "480"
+        value: "420"
       - key: RETRY_FAILED_JOINS
         value: "true"
       - key: RETRY_INTERVAL_HOURS
