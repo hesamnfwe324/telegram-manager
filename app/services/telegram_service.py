@@ -237,16 +237,26 @@ class TelegramUserService:
     async def forward_message_to_group(
         self, group_id: int, from_chat_id: int, message_id: int
     ) -> tuple[bool, str | None]:
-        """Forward a message to a group using the user client. Returns (success, error_reason)."""
+        """Forward a message to a group using the user client. Returns (success, error_reason).
+        
+        from_chat_id should be the bot's Telegram user_id so Telethon can locate
+        the message in the admin's conversation with the bot.
+        """
         try:
-            await self.client.forward_messages(group_id, message_id, from_chat_id)
+            # Resolve the source peer explicitly so Telethon can find the message
+            from_peer = await self.client.get_entity(from_chat_id)
+            await self.client.forward_messages(
+                entity=group_id,
+                messages=message_id,
+                from_peer=from_peer,
+            )
             return True, None
         except FloodWaitError as exc:
             logger.warning("FloodWait forwarding to group %d: wait %d seconds", group_id, exc.seconds)
             await asyncio.sleep(exc.seconds)
             return False, "flood_wait"
         except Exception as exc:
-            logger.error("Failed to forward to group %d: %s", group_id, exc)
+            logger.error("Failed to forward to group %d: %s", group_id, exc, exc_info=True)
             return False, str(exc)
 
     def on_new_message(self, handler: Any) -> None:
