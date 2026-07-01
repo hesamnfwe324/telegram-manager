@@ -2,11 +2,25 @@
 Non-blocking background broadcast service.
 Broadcasts run in a dedicated asyncio task — the bot stays responsive.
 Progress and results are reported to the requesting admin.
+
+ARCHITECTURE NOTE
+-----------------
+User DMs  → Bot API (aiogram)   : users interacted with the BOT, which knows them.
+                                   Telethon user-client has no access_hash for them.
+Group msgs → Telethon user client: the Telethon account joined those groups.
+                                   The bot may not be a member of every group.
 """
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramBadRequest,
+    TelegramRetryAfter,
+    TelegramMigrateToChat,
+)
 
 from app.config import settings
 from app.database.connection import AsyncSessionLocal
@@ -15,13 +29,12 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-DM_DELAY = 5          # seconds between DMs
+DM_DELAY = 3          # seconds between DMs (Bot API limit: 1 msg/s per chat)
 GROUP_DELAY = 2       # seconds between group sends
-MAX_STORED_JOBS = 50  # keep only last N completed jobs
-PER_CALL_TIMEOUT = 90 # max seconds for a single Telethon send call (prevents FloodWait hang)
-PROGRESS_EVERY = 50   # send a progress update to admin every N users
+MAX_STORED_JOBS = 50
+PER_CALL_TIMEOUT = 60 # max seconds for a single Telethon call (prevents FloodWait hang)
+PROGRESS_EVERY = 50   # send progress update every N users
 
-# Hard ceiling — 1 hour gives room for 700+ users even with retries.
 _MAX_BROADCAST_SECONDS: int = 3600
 
 
@@ -41,6 +54,7 @@ class BroadcastJob:
     deactivated: int = 0
     done: bool = False
     error: str | None = None
+    first_user_error: str | None = None
     first_group_error: str | None = None
     message_text: str = ""
     media_file_id: str | None = None
@@ -56,7 +70,7 @@ class BroadcastQueueService:
     def __init__(self) -> None:
         self._jobs: dict[str, BroadcastJob] = {}
         self._active: bool = False
-        self._task: asyncio.Task | None = None  # reference for real cancellation
+        self._task: asyncio.Task | None = None
 
     @classmethod
     def get_instance(cls) -> "BroadcastQueueService":
@@ -71,22 +85,16 @@ class BroadcastQueueService:
         return self._active
 
     def get_active_job(self) -> BroadcastJob | None:
-        """Return the currently running job, or None."""
         for job in self._jobs.values():
             if not job.done:
                 return job
         return None
 
     def cancel_active(self) -> bool:
-        """Cancel the running broadcast task immediately.
-
-        Returns True if a task was found and cancelled, False if nothing was running.
-        """
         if self._task and not self._task.done():
             self._task.cancel()
             logger.warning("BroadcastQueueService: active task cancelled by admin")
             return True
-        # No running task — just reset the flag
         self._active = False
         return False
 
@@ -145,13 +153,13 @@ class BroadcastQueueService:
             await asyncio.wait_for(coro, timeout=_MAX_BROADCAST_SECONDS)
         except asyncio.CancelledError:
             job.error = "cancelled by admin"
-            logger.warning("Broadcast job %s was cancelled", job.job_id)
+            logger.warning("Broadcast job %s cancelled", job.job_id)
         except asyncio.TimeoutError:
-            job.error = f"broadcast timed out after {_MAX_BROADCAST_SECONDS}s"
+            job.error = f"timed out after {_MAX_BROADCAST_SECONDS}s"
             logger.error("Broadcast job %s timed out", job.job_id)
         except Exception as exc:
             job.error = str(exc)
-            logger.error("Broadcast job %s failed: %s", job.job_id, exc, exc_info=True)
+            logger.error("Broadcast job %s crashed: %s", job.job_id, exc, exc_info=True)
         finally:
             job.done = True
             self._active = False
@@ -159,20 +167,145 @@ class BroadcastQueueService:
             self._prune_old_jobs()
             await self._report(job)
 
-    async def _safe_call(self, coro) -> tuple[bool, str | None]:
-        """Wrap a Telethon call with a per-call timeout.
+    # ══════════════════════════════════════════════════════════════════
+    # USER BROADCAST — uses Bot API (aiogram)
+    # ══════════════════════════════════════════════════════════════════
+    # CRITICAL: users are in contacted_users because they messaged the BOT.
+    # The Bot API knows them; the Telethon user-client does NOT (no access_hash).
+    # Using Telethon here causes PeerIdInvalidError for every user → 0 success.
+    # ══════════════════════════════════════════════════════════════════
 
-        Prevents a single FloodWait (potentially hours long) from freezing the
-        entire broadcast loop.  If the call takes longer than PER_CALL_TIMEOUT
-        seconds, we cancel it and mark that user/group as 'timeout' failure.
-        """
+    async def _bot_send_to_user(self, job: BroadcastJob, user_id: int) -> tuple[bool, str | None]:
+        """Send one message to a user via Bot API. Returns (ok, reason)."""
+        bot = job.bot
+        try:
+            # ── Forward (preserves "Forwarded from …" header) ─────────────────────
+            if job.is_forward and job.forward_from_chat_id and job.forward_from_message_id:
+                await bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=job.forward_from_chat_id,
+                    message_id=job.forward_from_message_id,
+                )
+
+            # ── Media via Bot API file_id (no download/re-upload needed) ──────────
+            elif job.media_file_id and job.media_type:
+                await self._bot_send_media(bot, user_id, job.media_file_id, job.media_type, job.message_text)
+
+            # ── Plain text ────────────────────────────────────────────────────────
+            elif job.message_text:
+                await bot.send_message(chat_id=user_id, text=job.message_text)
+
+            # ── Last resort: forward original message from admin's chat with bot ──
+            else:
+                await bot.forward_message(
+                    chat_id=user_id,
+                    from_chat_id=job.from_chat_id,
+                    message_id=job.message_id,
+                )
+
+            return True, None
+
+        except TelegramRetryAfter as exc:
+            # Bot API rate limit — respect it but cap at 120s
+            wait = min(exc.retry_after, 120)
+            logger.warning("Bot API RetryAfter for user %d: wait %ds", user_id, wait)
+            await asyncio.sleep(wait)
+            return False, f"retry_after_{exc.retry_after}s"
+
+        except TelegramForbiddenError:
+            # User blocked the bot
+            return False, "blocked"
+
+        except TelegramBadRequest as exc:
+            msg = str(exc).lower()
+            if "chat not found" in msg or "user not found" in msg:
+                return False, "deactivated"
+            if "bot was blocked" in msg:
+                return False, "blocked"
+            logger.warning("TelegramBadRequest for user %d: %s", user_id, exc)
+            return False, str(exc)[:120]
+
+        except TelegramMigrateToChat:
+            return False, "migrated"
+
+        except Exception as exc:
+            logger.error("Unexpected error sending to user %d: %s", user_id, exc)
+            return False, str(exc)[:120]
+
+    @staticmethod
+    async def _bot_send_media(bot: Any, chat_id: int, file_id: str, media_type: str, caption: str) -> None:
+        """Dispatch the right Bot API send method based on media_type."""
+        kw: dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            kw["caption"] = caption
+        if media_type == "photo":
+            await bot.send_photo(**kw, photo=file_id)
+        elif media_type == "video":
+            await bot.send_video(**kw, video=file_id)
+        elif media_type == "document":
+            await bot.send_document(**kw, document=file_id)
+        elif media_type == "audio":
+            await bot.send_audio(**kw, audio=file_id)
+        elif media_type == "voice":
+            await bot.send_voice(**kw, voice=file_id)
+        elif media_type == "animation":
+            await bot.send_animation(**kw, animation=file_id)
+        elif media_type == "sticker":
+            kw.pop("caption", None)  # stickers don't support captions
+            await bot.send_sticker(**kw, sticker=file_id)
+        elif media_type == "video_note":
+            kw.pop("caption", None)
+            await bot.send_video_note(**kw, video_note=file_id)
+        else:
+            # Fallback: treat as document
+            await bot.send_document(**kw, document=file_id)
+
+    async def _send_to_users(self, job: BroadcastJob) -> None:
+        async with AsyncSessionLocal() as session:
+            repo = ContactedUserRepository(session)
+            users = await repo.get_active(limit=10000)
+
+        job.total = len(users)
+        actor = str(job.actor_id)
+        logger.info("Broadcast job %s: sending to %d users via Bot API", job.job_id, job.total)
+
+        for idx, user in enumerate(users):
+            ok, reason = await self._bot_send_to_user(job, user.user_id)
+
+            if ok:
+                job.success += 1
+                await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
+            else:
+                job.failed += 1
+                if job.first_user_error is None:
+                    job.first_user_error = f"uid={user.user_id}: {reason}"
+                if reason == "blocked":
+                    job.blocked += 1
+                    await self._mark_user_blocked(user.user_id)
+                elif reason == "deactivated":
+                    job.deactivated += 1
+                    await self._mark_user_blocked(user.user_id)
+                await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+
+            done_count = idx + 1
+            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
+                await self._send_progress(job, done_count)
+
+            await asyncio.sleep(DM_DELAY)
+
+    # ══════════════════════════════════════════════════════════════════
+    # GROUP BROADCAST — uses Telethon (user-client is a member)
+    # ══════════════════════════════════════════════════════════════════
+
+    async def _tg_call(self, coro) -> tuple[bool, str | None]:
+        """Wrap a Telethon coroutine with a timeout to prevent FloodWait hang."""
         try:
             return await asyncio.wait_for(coro, timeout=PER_CALL_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning("Telethon call timed out after %ds", PER_CALL_TIMEOUT)
             return False, "per_call_timeout"
         except asyncio.CancelledError:
-            raise  # propagate cancellation so _run() can handle it
+            raise
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
         from app.services.telegram_service import TelegramUserService
@@ -186,12 +319,13 @@ class BroadcastQueueService:
 
         job.total = len(groups)
         actor = str(job.actor_id)
+        logger.info("Broadcast job %s: sending to %d groups via Telethon", job.job_id, job.total)
 
         for group in groups:
             group_link = group.invite_link or (
                 f"@{group.username}" if group.username else None
             )
-            ok, reason = await self._safe_call(
+            ok, reason = await self._tg_call(
                 tg.forward_message_to_group(
                     group_id=group.group_id,
                     group_link=group_link,
@@ -210,93 +344,23 @@ class BroadcastQueueService:
             else:
                 job.failed += 1
                 if job.first_group_error is None:
-                    job.first_group_error = f"{group.group_id}: {reason}"
+                    job.first_group_error = f"gid={group.group_id}: {reason}"
                 await self._log("broadcast_group_failed", "error", actor, str(group.group_id), reason)
             await asyncio.sleep(GROUP_DELAY)
 
-    async def _send_to_users(self, job: BroadcastJob) -> None:
-        from app.services.telegram_service import TelegramUserService
-        tg = TelegramUserService.get_instance()
-
-        async with AsyncSessionLocal() as session:
-            repo = ContactedUserRepository(session)
-            users = await repo.get_active(limit=10000)
-
-        job.total = len(users)
-        actor = str(job.actor_id)
-
-        for idx, user in enumerate(users):
-            # ── Priority 1: True forward — original chat + message_id ────────────────
-            if job.is_forward and job.forward_from_chat_id and job.forward_from_message_id:
-                ok, reason = await self._safe_call(
-                    tg.forward_message_to_user(
-                        user_id=user.user_id,
-                        from_chat_id=job.forward_from_chat_id,
-                        message_id=job.forward_from_message_id,
-                    )
-                )
-
-            # ── Priority 2: Media ─────────────────────────────────────────────────────
-            elif job.media_file_id and job.media_type:
-                ok, reason = await self._safe_call(
-                    tg.send_media_to_user(
-                        user_id=user.user_id,
-                        media_file_id=job.media_file_id,
-                        media_type=job.media_type,
-                        caption=job.message_text,
-                        bot=job.bot,
-                    )
-                )
-
-            # ── Priority 3: Plain text ────────────────────────────────────────────────
-            # CRITICAL: Do NOT use forward_message_to_user here — Telethon user client
-            # cannot access the bot's private chat to forward from it.
-            elif job.message_text:
-                ok, reason = await self._safe_call(
-                    tg.send_message_to_user(
-                        user_id=user.user_id,
-                        message=job.message_text,
-                    )
-                )
-
-            # ── Priority 4: Last resort forward ──────────────────────────────────────
-            else:
-                ok, reason = await self._safe_call(
-                    tg.forward_message_to_user(
-                        user_id=user.user_id,
-                        from_chat_id=job.from_chat_id,
-                        message_id=job.message_id,
-                    )
-                )
-
-            if ok:
-                job.success += 1
-                await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
-            else:
-                job.failed += 1
-                if reason == "blocked":
-                    job.blocked += 1
-                    await self._mark_user_blocked(user.user_id)
-                elif reason == "deactivated":
-                    job.deactivated += 1
-                    await self._mark_user_blocked(user.user_id)
-                await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
-
-            # Periodic progress report every PROGRESS_EVERY users
-            done_count = idx + 1
-            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
-                await self._send_progress(job, done_count)
-
-            await asyncio.sleep(DM_DELAY)
+    # ══════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ══════════════════════════════════════════════════════════════════
 
     async def _send_progress(self, job: BroadcastJob, done: int) -> None:
         try:
             pct = int(done / job.total * 100)
-            text = (
+            await job.bot.send_message(
+                job.actor_id,
                 f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
-                f"✅ {job.success} / ❌ {job.failed} / 📦 {done} از {job.total}"
+                f"✅ {job.success} موفق / ❌ {job.failed} ناموفق / 📦 {done} از {job.total}",
+                parse_mode="HTML",
             )
-            await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
         except Exception:
             pass
 
@@ -345,8 +409,10 @@ class BroadcastQueueService:
             )
             if job.error:
                 text += f"\n\n⚠️ خطا: <code>{job.error[:200]}</code>"
+            if job.first_user_error:
+                text += f"\n\n🔍 اولین خطای کاربر: <code>{job.first_user_error[:200]}</code>"
             if job.first_group_error:
-                text += f"\n\n🔍 خطای گروه: <code>{job.first_group_error[:300]}</code>"
+                text += f"\n\n🔍 اولین خطای گروه: <code>{job.first_group_error[:200]}</code>"
 
             await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
             for admin_id in settings.get_admin_id_list():
