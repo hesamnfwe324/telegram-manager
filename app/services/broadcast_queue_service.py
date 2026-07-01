@@ -37,7 +37,10 @@ class BroadcastJob:
     deactivated: int = 0
     done: bool = False
     error: str | None = None
-    first_group_error: str | None = None  # first per-group failure reason for reporting
+    first_group_error: str | None = None
+    message_text: str = ""
+    media_file_id: str | None = None
+    media_type: str | None = None
 
 
 class BroadcastQueueService:
@@ -75,6 +78,9 @@ class BroadcastQueueService:
         message_id: int,
         actor_id: int,
         bot: Any,
+        message_text: str = "",
+        media_file_id: str | None = None,
+        media_type: str | None = None,
     ) -> str:
         if self._active:
             raise RuntimeError("یک broadcast در حال اجرا است. لطفاً صبر کنید.")
@@ -88,6 +94,9 @@ class BroadcastQueueService:
             message_id=message_id,
             actor_id=actor_id,
             bot=bot,
+            message_text=message_text,
+            media_file_id=media_file_id,
+            media_type=media_type,
         )
         self._jobs[job_id] = job
         asyncio.create_task(self._run(job), name=f"broadcast-{job_id}")
@@ -157,9 +166,12 @@ class BroadcastQueueService:
             )
             ok, reason = await tg.forward_message_to_group(
                 group_id=group.group_id,
-                from_chat_id=bot_peer,
-                message_id=job.message_id,
                 group_link=group_link,
+                message_text=job.message_text,
+                media_file_id=job.media_file_id,
+                media_type=job.media_type,
+                fallback_from_peer=bot_peer,
+                fallback_message_id=job.message_id,
             )
             if ok:
                 job.success += 1
@@ -245,6 +257,8 @@ class BroadcastQueueService:
             )
             if job.error:
                 text += f"\n\n⚠️ خطا: <code>{job.error[:200]}</code>"
+            if job.first_group_error:
+                text += f"\n\n🔍 خطای گروه: <code>{job.first_group_error[:300]}</code>"
 
             await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
 
