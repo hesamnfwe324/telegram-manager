@@ -1,3 +1,4 @@
+TS_SHA: e85bf5eae7c6475f36ed5f4f08c850da3ce6b398
 SHA: 1aa9f677e11c8116f754a7647eb7d15a5c3c0da5
 import asyncio
 import re
@@ -516,6 +517,10 @@ class TelegramUserService:
 
     def on_new_message(self, handler: Any) -> None:
         self.client.add_event_handler(handler, events.NewMessage())
+
+    def on_chat_action(self, handler: Any) -> None:
+        """Register a handler for ChatAction events (user joined/added/left/etc.)."""
+        self.client.add_event_handler(handler, events.ChatAction())
 
     async def get_session_string(self) -> str:
         if isinstance(self.client.session, StringSession):
