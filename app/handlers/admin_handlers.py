@@ -39,7 +39,6 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    # AdminAuthMiddleware already blocks non-admins before this handler runs.
     await message.answer(
         "🤖 <b>ربات مدیریت گروه‌های تلگرام</b>\n\nانتخاب کنید:",
         parse_mode="HTML",
@@ -49,7 +48,6 @@ async def cmd_start(message: Message) -> None:
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
-    # AdminAuthMiddleware already blocks non-admins before this handler runs.
     await message.answer("منوی اصلی:", reply_markup=main_menu_keyboard())
 
 
@@ -122,42 +120,34 @@ async def cb_system_stop(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "error_logs")
 async def cb_error_logs(callback: CallbackQuery) -> None:
-    """Show recent error entries from the bot_logs table."""
+    """Show recent error entries from the logs table."""
     await callback.answer()
     from app.database.connection import AsyncSessionLocal
-    from sqlalchemy import text
-
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            text(
-                "SELECT action, result, actor, target, details, created_at "
-                "FROM bot_logs "
-                "WHERE result = 'error' OR action LIKE '%fail%' OR action LIKE '%error%' "
-                "ORDER BY created_at DESC LIMIT 15"
-            )
-        )
-        rows = result.fetchall()
+    from app.repositories import LogRepository
 
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="error_logs")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
     ])
 
-    if not rows:
+    async with AsyncSessionLocal() as session:
+        repo = LogRepository(session)
+        logs = await repo.get_errors(limit=15)
+
+    if not logs:
         await callback.message.edit_text(  # type: ignore[union-attr]
             "✅ هیچ خطایی در لاگ‌ها ثبت نشده.",
             reply_markup=back_kb,
         )
         return
 
-    lines = [f"🚨 <b>آخرین خطاها ({len(rows)}):</b>\n"]
-    for row in rows:
-        action, result, actor, target, details, created_at = row
-        ts = created_at.strftime("%m/%d %H:%M") if created_at else "?"
-        detail_str = str(details or "")[:60]
+    lines = [f"🚨 <b>آخرین خطاها ({len(logs)}):</b>\n"]
+    for log in logs:
+        ts = log.timestamp.strftime("%m/%d %H:%M") if log.timestamp else "?"
+        detail = (log.error_message or log.details or "")[:60]
         lines.append(
-            f"⏱ <code>{ts}</code>  <b>{action}</b> → {result}"
-            + (f"\n<i>{detail_str}</i>" if detail_str else "")
+            f"⏱ <code>{ts}</code>  <b>{log.action}</b>"
+            + (f"\n<i>{detail}</i>" if detail else "")
         )
 
     await callback.message.edit_text(  # type: ignore[union-attr]
