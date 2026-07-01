@@ -113,6 +113,11 @@ class BroadcastQueueService:
         from app.services.telegram_service import TelegramUserService
         tg = TelegramUserService.get_instance()
 
+        # Refresh entity cache so recently-joined groups are resolvable.
+        # With StringSession after a restart, the in-memory entity cache is
+        # cleared; get_dialogs() reloads it from Telegram.
+        await tg.refresh_dialogs()
+
         async with AsyncSessionLocal() as session:
             repo = GroupRepository(session)
             groups = await repo.get_joined()
