@@ -47,17 +47,26 @@ async def _init_db() -> None:
     logger.info("Database tables ensured")
 
 
-def _build_storage():
+async def _build_storage():
+    """Build FSM storage — Redis if available, MemoryStorage as fallback."""
     if settings.redis_enabled:
         try:
             from aiogram.fsm.storage.redis import RedisStorage
             storage = RedisStorage.from_url(settings.REDIS_URL)
-            logger.info("Using Redis FSM storage: %s", settings.REDIS_URL.split("@")[-1])
+            # Test the connection before committing to Redis
+            await storage.redis.ping()
+            logger.info("Redis FSM storage connected: %s", settings.REDIS_URL.split("@")[-1])
             return storage
         except ImportError:
-            logger.warning("aiogram-redis-provider not installed — falling back to MemoryStorage")
+            logger.warning("Redis storage package not available — falling back to MemoryStorage")
+        except Exception as exc:
+            logger.warning(
+                "Redis not reachable (%s) — falling back to MemoryStorage. "
+                "FSM states will be lost on restart.",
+                exc,
+            )
     from aiogram.fsm.storage.memory import MemoryStorage
-    logger.warning("Using in-memory FSM storage — states lost on restart. Set REDIS_URL for production.")
+    logger.warning("Using in-memory FSM storage — states lost on restart. Set a reachable REDIS_URL for production.")
     return MemoryStorage()
 
 
@@ -71,7 +80,6 @@ async def main() -> None:
             "Set ADMIN_IDS to a comma-separated list of Telegram user IDs."
         )
 
-    # Register signal handlers using the running event loop for thread-safety
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _request_shutdown, loop)
@@ -84,7 +92,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    storage = _build_storage()
+    storage = await _build_storage()
     dp = Dispatcher(storage=storage)
     dp.include_router(get_main_router())
     dp.message.middleware(AdminAuthMiddleware())
@@ -122,7 +130,6 @@ async def main() -> None:
     asyncio.create_task(_start_client_safe())
     scheduler.start()
 
-    # Run bot polling until shutdown signal
     logger.info("Bot polling started")
     polling_task = asyncio.create_task(
         dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
