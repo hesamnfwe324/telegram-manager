@@ -1,5 +1,6 @@
 import asyncio
 import re
+from io import BytesIO
 from typing import Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -10,6 +11,9 @@ from telethon.errors import (
     UserIsBlockedError,
     InputUserDeactivatedError,
     PeerFloodError,
+    ChatWriteForbiddenError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
 )
 
 from app.config import settings
@@ -20,6 +24,9 @@ logger = get_logger(__name__)
 _PRIVATE_INVITE_RE = re.compile(
     r"t\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)", re.I
 )
+
+# Media types that support a caption field in Telethon send_file
+_CAPTIONABLE = {"photo", "video", "document", "audio", "animation"}
 
 
 class TelegramUserService:
@@ -97,7 +104,6 @@ class TelegramUserService:
                 return isinstance(chat, (Chat, Channel)) and not getattr(chat, "broadcast", False)
             return False
         if isinstance(entity, ChatInvite):
-            # Valid group/supergroup invite — broadcast=False means it's a group
             return not getattr(entity, "broadcast", False)
         return isinstance(entity, (Chat, Channel)) and not getattr(entity, "broadcast", False)
 
@@ -116,7 +122,6 @@ class TelegramUserService:
                 )
             return None, None, None, None
         if isinstance(entity, ChatInvite):
-            # Private invite not yet joined — group_id unknown until we actually join
             return (
                 None,
                 getattr(entity, "title", None),
@@ -146,9 +151,6 @@ class TelegramUserService:
         Join a group by invite link or public username.
 
         Returns (success, real_group_id).
-        - For private invite links the real group_id is extracted from the join
-          response so callers can update any placeholder record.
-        - For public links the entity is resolved first and its id returned.
         """
         try:
             m = _PRIVATE_INVITE_RE.search(link)
@@ -234,6 +236,44 @@ class TelegramUserService:
         except Exception as exc:
             logger.error("Failed to forward to %d: %s", user_id, exc)
             return False, str(exc)
+
+    async def send_media_to_user(
+        self,
+        user_id: int,
+        media_file_id: str,
+        media_type: str,
+        caption: str = "",
+        bot: Any = None,
+    ) -> tuple[bool, str | None]:
+        """Download a Bot API file and re-upload it to a user via Telethon."""
+        try:
+            bio = await self._download_bot_file(media_file_id, bot)
+            if bio is None:
+                return False, "download_failed"
+            kwargs: dict[str, Any] = {"file": bio}
+            if media_type in _CAPTIONABLE and caption:
+                kwargs["caption"] = caption
+            if media_type == "voice":
+                kwargs["voice_note"] = True
+            elif media_type == "video_note":
+                kwargs["video_note"] = True
+            await self.client.send_file(user_id, **kwargs)
+            return True, None
+        except UserIsBlockedError:
+            return False, "blocked"
+        except InputUserDeactivatedError:
+            return False, "deactivated"
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds)
+            return False, "flood_wait"
+        except Exception as exc:
+            logger.error("Failed to send media to user %d: %s", user_id, exc)
+            return False, str(exc)
+
+    # ------------------------------------------------------------------
+    # Core broadcast method for groups
+    # ------------------------------------------------------------------
+
     async def forward_message_to_group(
         self,
         group_id: int,
@@ -241,20 +281,25 @@ class TelegramUserService:
         message_text: str = "",
         media_file_id: str | None = None,
         media_type: str | None = None,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_from_message_id: int | None = None,
+        bot: Any = None,
+        # Legacy params kept for compatibility — no longer used for primary logic
         fallback_from_peer: str | None = None,
         fallback_message_id: int | None = None,
     ) -> tuple[bool, str | None]:
         """Send a broadcast message to a group via the Telethon user client.
 
-        Primary path: use stored message_text / media_file_id (no ID lookup needed).
-        Fallback: try forward_messages with the original Bot API message_id
-                  (works only if Bot API ID == MTProto ID, which is NOT guaranteed
-                  in private chats, so this is a best-effort safety net).
-
-        group_link (invite_link or @username) is preferred for entity resolution.
+        Priority order:
+        1. If is_forward=True and we have the original chat+message IDs →
+           use Telethon forward_messages (preserves "Forwarded from …" header).
+        2. If media_file_id is set → download via Bot API and re-upload.
+        3. If message_text is set → send as plain text.
         """
         try:
             # --- Resolve destination group entity ---
+            dest_entity: Any
             if group_link:
                 try:
                     dest_entity = await self.client.get_entity(group_link)
@@ -267,52 +312,74 @@ class TelegramUserService:
             else:
                 dest_entity = group_id
 
-            # --- Primary: send content directly (avoids Bot API ↔ MTProto ID mismatch) ---
-            if media_file_id and media_type:
-                # Resolve the Bot API file_id to a Telegram InputMedia object.
-                # We use get_messages on 'me' (Saved Messages) as a staging step:
-                # send the file to Saved Messages first, grab the returned media,
-                # then forward that media to the group.
-                # Simpler alternative: download via Bot API and re-upload — skip for now.
-                # For now use the fallback path for media; primary path covers text.
-                pass  # fall through to fallback for media
-
-            if message_text and not media_file_id:
-                # Pure text message — send directly, zero risk of ID mismatch.
-                await self.client.send_message(dest_entity, message_text)
-                return True, None
-
-            # --- Fallback: try get_messages with Bot API message_id ---
-            if fallback_from_peer and fallback_message_id:
+            # ----------------------------------------------------------------
+            # Path 1: TRUE FORWARD — use Telethon forward_messages so the
+            # "Forwarded from <source>" label is preserved in the destination.
+            # ----------------------------------------------------------------
+            if is_forward and forward_from_chat_id and forward_from_message_id:
                 try:
-                    from_entity = await self.client.get_entity(fallback_from_peer)
-                    msgs = await self.client.get_messages(from_entity, ids=[fallback_message_id])
-                    if msgs and msgs[0] is not None:
-                        original = msgs[0]
-                        if original.media:
-                            await self.client.send_file(
-                                dest_entity,
-                                original.media,
-                                caption=original.message or "",
-                            )
-                        else:
-                            await self.client.send_message(dest_entity, original.message or "")
-                        return True, None
-                    else:
-                        logger.warning(
-                            "get_messages returned empty for msg_id %d from %s — ",
-                            fallback_message_id, fallback_from_peer,
-                        )
-                except Exception as fallback_exc:
-                    logger.warning("Fallback get_messages failed: %s", fallback_exc)
+                    await self.client.forward_messages(
+                        dest_entity,
+                        messages=forward_from_message_id,
+                        from_peer=forward_from_chat_id,
+                    )
+                    return True, None
+                except (ChannelPrivateError, Exception) as fwd_exc:
+                    # Source may not be accessible from the user account.
+                    # Fall through to media/text fallback.
+                    logger.warning(
+                        "forward_messages failed for group %d (source %d msg %d): %s — trying fallback",
+                        group_id, forward_from_chat_id, forward_from_message_id, fwd_exc,
+                    )
+                    # If we have media or text captured at receive time, use those.
+                    if not media_file_id and not message_text:
+                        return False, f"forward_failed: {fwd_exc}"
 
-            # --- Last resort: if we have text from any source ---
+            # ----------------------------------------------------------------
+            # Path 2: MEDIA — download from Bot API and re-upload via Telethon.
+            # This is the correct fix for photos/videos/docs: Bot API file_ids
+            # cannot be used by Telethon directly. We download the bytes first.
+            # ----------------------------------------------------------------
+            if media_file_id and media_type:
+                bio = await self._download_bot_file(media_file_id, bot)
+                if bio is not None:
+                    try:
+                        kwargs: dict[str, Any] = {"file": bio}
+                        if media_type in _CAPTIONABLE and message_text:
+                            kwargs["caption"] = message_text
+                        if media_type == "voice":
+                            kwargs["voice_note"] = True
+                        elif media_type == "video_note":
+                            kwargs["video_note"] = True
+                        await self.client.send_file(dest_entity, **kwargs)
+                        return True, None
+                    except Exception as media_exc:
+                        logger.warning(
+                            "send_file to group %d failed: %s — trying text fallback",
+                            group_id, media_exc,
+                        )
+                        # Fall through to text if we have it
+                        if not message_text:
+                            return False, str(media_exc)
+                else:
+                    logger.warning(
+                        "Could not download file_id for group %d — trying text fallback",
+                        group_id,
+                    )
+                    if not message_text:
+                        return False, "media_download_failed"
+
+            # ----------------------------------------------------------------
+            # Path 3: PLAIN TEXT
+            # ----------------------------------------------------------------
             if message_text:
                 await self.client.send_message(dest_entity, message_text)
                 return True, None
 
             return False, "no_sendable_content"
 
+        except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+            return False, f"no_write_permission: {exc}"
         except FloodWaitError as exc:
             logger.warning(
                 "FloodWait sending to group %d: wait %d seconds (~%.1fh)",
@@ -322,13 +389,34 @@ class TelegramUserService:
         except Exception as exc:
             logger.error("Failed to send to group %d: %s", group_id, exc, exc_info=True)
             return False, str(exc)
-    async def refresh_dialogs(self, limit: int = 50, timeout: float = 12.0) -> None:
-        """Refresh Telethon's entity cache with a strict timeout.
 
-        get_dialogs() can hang indefinitely on slow connections or overloaded
-        accounts.  We wrap it with asyncio.wait_for so that a broadcast job
-        is never stuck forever waiting for this prefetch to complete.
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _download_bot_file(self, file_id: str, bot: Any) -> BytesIO | None:
+        """Download a file from Telegram using the Bot API and return as BytesIO.
+
+        Bot API file_ids cannot be used by Telethon directly. This bridge
+        downloads the bytes via the aiogram Bot object so Telethon can
+        re-upload them as native media.
         """
+        if bot is None:
+            logger.warning("_download_bot_file: bot is None, cannot download file_id %s", file_id)
+            return None
+        try:
+            bio = await bot.download(file_id)
+            if bio is None:
+                return None
+            # aiogram returns BytesIO; ensure position is at start
+            bio.seek(0)
+            return bio  # type: ignore[return-value]
+        except Exception as exc:
+            logger.warning("Failed to download file_id %s via Bot API: %s", file_id, exc)
+            return None
+
+    async def refresh_dialogs(self, limit: int = 50, timeout: float = 12.0) -> None:
+        """Refresh Telethon's entity cache with a strict timeout."""
         try:
             await asyncio.wait_for(
                 self.client.get_dialogs(limit=limit),
