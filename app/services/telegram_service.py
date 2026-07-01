@@ -235,20 +235,46 @@ class TelegramUserService:
             logger.error("Failed to forward to %d: %s", user_id, exc)
             return False, str(exc)
     async def forward_message_to_group(
-        self, group_id: int, from_chat_id: int | str, message_id: int
+        self,
+        group_id: int,
+        from_chat_id: int | str,
+        message_id: int,
+        group_link: str | None = None,
     ) -> tuple[bool, str | None]:
-        """Forward a message to a group using the user client. Returns (success, error_reason).
-        
-        from_chat_id should be the bot's Telegram user_id so Telethon can locate
-        the message in the admin's conversation with the bot.
+        """Forward a message to a group using the user client.
+
+        Args:
+            group_id: Telegram group_id stored in DB (may be a placeholder).
+            from_chat_id: Bot username (e.g. '@MyBot') — most reliable way to
+                locate the admin's message in the admin→bot conversation.
+            message_id: ID of the message the admin sent to the bot.
+            group_link: Invite link or @username for the group (preferred for
+                entity resolution; avoids relying on session cache).
         """
         try:
-            # Resolve the source peer explicitly so Telethon can find the message
-            from_peer = await self.client.get_entity(from_chat_id)
+            # 1. Resolve source peer via username — always works without access_hash.
+            from_entity = await self.client.get_entity(from_chat_id)
+
+            # 2. Resolve destination group.
+            #    Prefer invite_link / @username because they resolve without a
+            #    cached access_hash.  Fall back to integer group_id only if
+            #    no link is available.
+            if group_link:
+                try:
+                    dest_entity = await self.client.get_entity(group_link)
+                except Exception as link_exc:
+                    logger.warning(
+                        "Cannot resolve group via link %s: %s — falling back to group_id %d",
+                        group_link, link_exc, group_id,
+                    )
+                    dest_entity = group_id
+            else:
+                dest_entity = group_id
+
             await self.client.forward_messages(
-                entity=group_id,
+                entity=dest_entity,
                 messages=message_id,
-                from_peer=from_peer,
+                from_peer=from_entity,
             )
             return True, None
         except FloodWaitError as exc:
