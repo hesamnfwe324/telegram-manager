@@ -1,6 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    MessageOriginChannel, MessageOriginChat,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -51,9 +52,58 @@ async def cancel_send(message: Message, state: FSMContext) -> None:
 
 @router.message(SendMessageStates.waiting_content)
 async def receive_content(message: Message, state: FSMContext) -> None:
+    # ── Detect forwarded messages and capture original source ──────────────
+    is_forward: bool = False
+    forward_from_chat_id: int | None = None
+    forward_from_message_id: int | None = None
+
+    if message.forward_origin is not None:
+        is_forward = True
+        origin = message.forward_origin
+        if isinstance(origin, MessageOriginChannel):
+            forward_from_chat_id = origin.chat.id
+            forward_from_message_id = origin.message_id
+        elif isinstance(origin, MessageOriginChat):
+            forward_from_chat_id = origin.sender_chat.id
+            # MessageOriginChat does not expose the original message_id
+
+    # ── Extract media file_id ───────────────────────────────────────────────
+    media_file_id: str | None = None
+    media_type: str | None = None
+    if message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.video:
+        media_file_id = message.video.file_id
+        media_type = "video"
+    elif message.document:
+        media_file_id = message.document.file_id
+        media_type = "document"
+    elif message.audio:
+        media_file_id = message.audio.file_id
+        media_type = "audio"
+    elif message.voice:
+        media_file_id = message.voice.file_id
+        media_type = "voice"
+    elif message.sticker:
+        media_file_id = message.sticker.file_id
+        media_type = "sticker"
+    elif message.video_note:
+        media_file_id = message.video_note.file_id
+        media_type = "video_note"
+    elif message.animation:
+        media_file_id = message.animation.file_id
+        media_type = "animation"
+
     await state.update_data(
         content_message_id=message.message_id,
         content_chat_id=message.chat.id,
+        message_text=message.text or message.caption or "",
+        media_file_id=media_file_id,
+        media_type=media_type,
+        is_forward=is_forward,
+        forward_from_chat_id=forward_from_chat_id,
+        forward_from_message_id=forward_from_message_id,
     )
     await state.set_state(SendMessageStates.confirming)
     await message.answer(
@@ -127,7 +177,13 @@ async def cb_send_to_group(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "send_to_all", SendMessageStates.selecting_targets)
 async def cb_send_to_all(callback: CallbackQuery, state: FSMContext) -> None:
-    """Delegate to BroadcastQueueService — non-blocking, runs in background."""
+    """Delegate to BroadcastQueueService — non-blocking, runs in background.
+
+    FIX: Pass full message content (text, media, forward metadata) so the
+    broadcast service can choose the correct send path per user/group.
+    Previously only from_chat_id + message_id were passed, causing Telethon
+    to try forwarding from the bot's private chat (which it cannot access).
+    """
     data = await state.get_data()
     await state.clear()
     bqs = BroadcastQueueService.get_instance()
@@ -139,6 +195,12 @@ async def cb_send_to_all(callback: CallbackQuery, state: FSMContext) -> None:
             message_id=data["content_message_id"],
             actor_id=actor_id,
             bot=callback.bot,
+            message_text=data.get("message_text", ""),
+            media_file_id=data.get("media_file_id"),
+            media_type=data.get("media_type"),
+            is_forward=data.get("is_forward", False),
+            forward_from_chat_id=data.get("forward_from_chat_id"),
+            forward_from_message_id=data.get("forward_from_message_id"),
         )
         await callback.answer()
         await callback.message.edit_text(  # type: ignore[union-attr]
