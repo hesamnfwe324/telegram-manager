@@ -20,6 +20,10 @@ DM_DELAY = 5        # seconds between DMs
 GROUP_DELAY = 2     # seconds between group sends
 MAX_STORED_JOBS = 50   # keep only last N completed jobs to prevent memory leak
 
+# Hard ceiling so a stuck broadcast cannot block the queue forever.
+# 1 hour is generous enough for 700+ users (5s each) or 1800+ groups (2s each).
+_MAX_BROADCAST_SECONDS: int = 3600
+
 
 @dataclass
 class BroadcastJob:
@@ -121,9 +125,6 @@ class BroadcastQueueService:
             for jid, _ in done_jobs[:len(done_jobs) - MAX_STORED_JOBS]:
                 del self._jobs[jid]
 
-    # Hard ceiling so a stuck broadcast cannot block the queue forever.
-    _MAX_BROADCAST_SECONDS: int = 300  # 5 minutes
-
     async def _run(self, job: BroadcastJob) -> None:
         self._active = True
         try:
@@ -132,9 +133,9 @@ class BroadcastQueueService:
                 if job.target == "groups"
                 else self._send_to_users(job)
             )
-            await asyncio.wait_for(coro, timeout=self._MAX_BROADCAST_SECONDS)
+            await asyncio.wait_for(coro, timeout=_MAX_BROADCAST_SECONDS)
         except asyncio.TimeoutError:
-            job.error = f"broadcast timed out after {self._MAX_BROADCAST_SECONDS}s"
+            job.error = f"broadcast timed out after {_MAX_BROADCAST_SECONDS}s"
             logger.error("Broadcast job %s timed out", job.job_id)
         except Exception as exc:
             job.error = str(exc)
@@ -150,7 +151,8 @@ class BroadcastQueueService:
         tg = TelegramUserService.get_instance()
 
         # Refresh entity cache so recently-joined groups are resolvable.
-        await tg.refresh_dialogs()
+        # Limit 500 so groups beyond the first 50 dialogs are included.
+        await tg.refresh_dialogs(limit=500)
 
         async with AsyncSessionLocal() as session:
             repo = GroupRepository(session)
@@ -196,14 +198,20 @@ class BroadcastQueueService:
         actor = str(job.actor_id)
 
         for user in users:
-            # For user DMs: if it's a forward with full origin info, forward from source.
-            # Otherwise fall back to the existing forward_message_to_user path.
+            ok: bool
+            reason: str | None
+
+            # ── Priority 1: True forward — original chat + message_id available ──────
+            # Use Telethon forward_messages so "Forwarded from …" header is preserved.
             if job.is_forward and job.forward_from_chat_id and job.forward_from_message_id:
                 ok, reason = await tg.forward_message_to_user(
                     user_id=user.user_id,
                     from_chat_id=job.forward_from_chat_id,
                     message_id=job.forward_from_message_id,
                 )
+
+            # ── Priority 2: Media — download via Bot API and re-upload ───────────────
+            # Bot API file_ids cannot be used by Telethon directly.
             elif job.media_file_id and job.media_type:
                 ok, reason = await tg.send_media_to_user(
                     user_id=user.user_id,
@@ -212,6 +220,21 @@ class BroadcastQueueService:
                     caption=job.message_text,
                     bot=job.bot,
                 )
+
+            # ── Priority 3: Plain text — send directly via Telethon ──────────────────
+            # CRITICAL FIX: Do NOT forward from from_chat_id (bot's private chat) here
+            # because the Telethon user client cannot access bot private chat messages.
+            # Use send_message_to_user instead which sends via the user account directly.
+            elif job.message_text:
+                ok, reason = await tg.send_message_to_user(
+                    user_id=user.user_id,
+                    message=job.message_text,
+                )
+
+            # ── Priority 4: Last resort — forward from original bot message ──────────
+            # Reached only when is_forward=True but forward_from_message_id is missing
+            # (e.g. forwarded from a group where Telegram hides the origin message_id).
+            # Telethon may or may not have access to from_chat_id; failure is expected.
             else:
                 ok, reason = await tg.forward_message_to_user(
                     user_id=user.user_id,
