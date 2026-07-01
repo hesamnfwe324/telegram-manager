@@ -248,10 +248,17 @@ async def cb_retry_all_failed(callback: CallbackQuery) -> None:
 
 # ── Admin sends link directly to the bot ──────────────────────────────────────
 
+import hashlib
 from aiogram.filters import StateFilter
 from aiogram.fsm.state import default_state
 from aiogram.types import Message
 from app.utils.validators import LinkValidator
+
+
+def _placeholder_group_id(link: str) -> int:
+    """Generate a stable negative placeholder ID for private invite links before joining."""
+    h = int(hashlib.md5(link.encode()).hexdigest()[:10], 16) % (10 ** 9)
+    return -h  # Negative to distinguish from real Telegram IDs
 
 
 @router.message(StateFilter(default_state), F.text)
@@ -293,10 +300,13 @@ async def handle_admin_link(message: Message) -> None:
                 results.append(f"⚠️ این یک کانال است نه گروه: <code>{normalized}</code>")
                 continue
 
-            group_id: int = entity.id
-            title: str | None = getattr(entity, "title", None)
-            username: str | None = getattr(entity, "username", None)
-            members_count: int | None = getattr(entity, "participants_count", None)
+            # get_entity_info handles ChatInvite / ChatInviteAlready / regular entities
+            group_id, title, username, members_count = await tg.get_entity_info(entity)
+
+            # For private invite links not yet joined, group_id is None —
+            # use a stable placeholder so we can store the record and track it.
+            if group_id is None:
+                group_id = _placeholder_group_id(normalized)
 
             async with AsyncSessionLocal() as session:
                 group_repo = GroupRepository(session)
@@ -304,6 +314,15 @@ async def handle_admin_link(message: Message) -> None:
                 if existing:
                     results.append(
                         f"ℹ️ قبلاً ثبت شده: <b>{title or group_id}</b> — وضعیت: {existing.status.value}"
+                    )
+                    continue
+
+                # Also check by invite_link to avoid duplicates when placeholder differs
+                existing_by_link = await group_repo.get_by_invite_link(normalized)
+                if existing_by_link:
+                    results.append(
+                        f"ℹ️ قبلاً با این لینک ثبت شده: <b>{existing_by_link.title or existing_by_link.group_id}</b>"
+                        f" — وضعیت: {existing_by_link.status.value}"
                     )
                     continue
 
