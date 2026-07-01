@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     )
 
     # Telegram User Client (Telethon)
-    TELEGRAM_API_ID: int
-    TELEGRAM_API_HASH: str
-    TELEGRAM_PHONE: str
+    TELEGRAM_API_ID: int = 2040
+    TELEGRAM_API_HASH: str = "b18441a1ff607e10a989891a5462e627"
+    TELEGRAM_PHONE: str = ""
     TELEGRAM_SESSION_NAME: str = "tg_session"
     TELEGRAM_SESSION_STRING: str = ""
 
@@ -42,23 +42,22 @@ class Settings(BaseSettings):
     # Backup
     BACKUP_DIR: str = "/tmp/backups"
     BACKUP_KEEP_DAYS: int = 7
-    BACKUP_DAILY_HOUR: int = 3        # UTC hour for daily backup
+    BACKUP_DAILY_HOUR: int = 3
 
     # S3-compatible backup upload (optional)
     S3_BUCKET: str = ""
-    S3_ENDPOINT: str = ""            # e.g. https://r2.example.com (for Cloudflare R2)
+    S3_ENDPOINT: str = ""
     S3_ACCESS_KEY: str = ""
     S3_SECRET_KEY: str = ""
     S3_REGION: str = "auto"
 
     # Discovery
-    # Comma-separated keywords; if set, only messages containing at least one are scanned
     DISCOVERY_KEYWORDS: str = ""
-    MAX_JOINS_PER_DAY: int = 50       # Anti-detection: max joins in 24h
+    MAX_JOINS_PER_DAY: int = 50
 
     # Join queue (anti-detection)
-    JOIN_DELAY_MIN: int = 240         # seconds (4 min)
-    JOIN_DELAY_MAX: int = 480         # seconds (8 min)
+    JOIN_DELAY_MIN: int = 240
+    JOIN_DELAY_MAX: int = 480
 
     # Auto-retry for failed joins
     RETRY_FAILED_JOINS: bool = True
