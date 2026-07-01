@@ -37,6 +37,7 @@ class BroadcastJob:
     deactivated: int = 0
     done: bool = False
     error: str | None = None
+    first_group_error: str | None = None  # first per-group failure reason for reporting
 
 
 class BroadcastQueueService:
@@ -126,16 +127,25 @@ class BroadcastQueueService:
         bot_peer = f"@{bot_me.username}"
 
         for group in groups:
+            # Prefer invite_link or @username so Telethon resolves the entity
+            # without relying on the session cache (which may not include groups
+            # joined after the session string was generated).
+            group_link = group.invite_link or (
+                f"@{group.username}" if group.username else None
+            )
             ok, reason = await tg.forward_message_to_group(
                 group_id=group.group_id,
                 from_chat_id=bot_peer,
                 message_id=job.message_id,
+                group_link=group_link,
             )
             if ok:
                 job.success += 1
                 await self._log("broadcast_group_sent", "success", actor, str(group.group_id))
             else:
                 job.failed += 1
+                if job.first_group_error is None:
+                    job.first_group_error = f"{group.group_id}: {reason}"
                 await self._log("broadcast_group_failed", "error", actor, str(group.group_id), reason)
             await asyncio.sleep(GROUP_DELAY)
 
