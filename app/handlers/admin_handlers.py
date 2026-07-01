@@ -118,3 +118,50 @@ async def cb_system_stop(callback: CallbackQuery) -> None:
     actor = callback.from_user.id if callback.from_user else "?"
     await callback.answer("⏹ سیستم متوقف شد.", show_alert=True)
     logger.info("System stopped by admin %s", actor)
+
+
+@router.callback_query(F.data == "error_logs")
+async def cb_error_logs(callback: CallbackQuery) -> None:
+    """Show recent error entries from the bot_logs table."""
+    await callback.answer()
+    from app.database.connection import AsyncSessionLocal
+    from sqlalchemy import text
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            text(
+                "SELECT action, result, actor, target, details, created_at "
+                "FROM bot_logs "
+                "WHERE result = 'error' OR action LIKE '%fail%' OR action LIKE '%error%' "
+                "ORDER BY created_at DESC LIMIT 15"
+            )
+        )
+        rows = result.fetchall()
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="error_logs")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
+    ])
+
+    if not rows:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "✅ هیچ خطایی در لاگ‌ها ثبت نشده.",
+            reply_markup=back_kb,
+        )
+        return
+
+    lines = [f"🚨 <b>آخرین خطاها ({len(rows)}):</b>\n"]
+    for row in rows:
+        action, result, actor, target, details, created_at = row
+        ts = created_at.strftime("%m/%d %H:%M") if created_at else "?"
+        detail_str = str(details or "")[:60]
+        lines.append(
+            f"⏱ <code>{ts}</code>  <b>{action}</b> → {result}"
+            + (f"\n<i>{detail_str}</i>" if detail_str else "")
+        )
+
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        "\n\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=back_kb,
+    )
