@@ -261,8 +261,7 @@ class TelegramUserService:
         except InputUserDeactivatedError:
             return False, "deactivated"
         except PeerFloodError:
-            logger.warning("PeerFlood — too many DMs sent; backing off 60s")
-            await asyncio.sleep(60)
+            logger.warning("PeerFlood sending DM to %d — returning immediately", user_id)
             return False, "peer_flood"
         except FloodWaitError as exc:
             logger.warning(
@@ -286,8 +285,7 @@ class TelegramUserService:
         except InputUserDeactivatedError:
             return False, "deactivated"
         except PeerFloodError:
-            logger.warning("PeerFlood forwarding — backing off 60s")
-            await asyncio.sleep(60)
+            logger.warning("PeerFlood forwarding to %d — returning immediately", user_id)
             return False, "peer_flood"
         except FloodWaitError as exc:
             logger.warning(
