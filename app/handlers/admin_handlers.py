@@ -36,7 +36,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="▶️ شروع سیستم", callback_data="system_start"),
             InlineKeyboardButton(text="⏹ توقف سیستم", callback_data="system_stop"),
         ],
-        [InlineKeyboardButton(text="U0001f504 همگام‌سازی گروه‌ها", callback_data="sync_dialogs")],
+        [InlineKeyboardButton(text="U0001f504 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
+            InlineKeyboardButton(text="👥 همگام‌سازی مخاطبین", callback_data="sync_users")],
     ])
 
 
@@ -246,53 +247,84 @@ async def cb_error_logs(callback: CallbackQuery) -> None:
     )
 
 
-    def _back_btn() -> InlineKeyboardMarkup:
-      return InlineKeyboardMarkup(inline_keyboard=[
-          [InlineKeyboardButton(text="U0001f519 بازگشت", callback_data="main_menu")]
-      ])
+def _back_btn() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")]
+    ])
 
 
-    @router.callback_query(F.data == "sync_dialogs")
-    async def cb_sync_dialogs(callback: CallbackQuery) -> None:
-      """همگام‌سازی تمام دیالوگ‌های تلگرام با دیتابیس."""
-      await callback.answer()
-      try:
-          await callback.message.edit_text(  # type: ignore[union-attr]
-              "⏳ <b>در حال همگام‌سازی گروه‌ها...</b>\n\nلطفاً چند ثانیه صبر کنید.",
-              parse_mode="HTML",
-              reply_markup=_back_btn(),
-          )
-      except Exception:
-          pass
-      try:
-          from app.services.telegram_service import TelegramUserService
-          tg = TelegramUserService.get_instance()
-          new_count, total = await tg.sync_dialogs_to_db()
-          text = (
-              f"✅ <b>همگام‌سازی کامل شد</b>\n\n"
-              f"U0001f4e6 کل گروه‌های اکانت: <code>{total}</code>\n"
-              f"U0001f195 جدید اضافه شده: <code>{new_count}</code>\n"
-              f"♻️ موجود در دیتابیس: <code>{total - new_count}</code>"
-          )
-      except Exception as exc:
-          text = f"❌ <b>خطا:</b>\n<code>{str(exc)[:300]}</code>"
-      try:
-          await callback.message.edit_text(  # type: ignore[union-attr]
-              text, parse_mode="HTML", reply_markup=_back_btn(),
-          )
-      except Exception:
-          pass
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "🤖 <b>ربات مدیریت گروه‌های تلگرام</b>\n\nانتخاب کنید:",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        pass
 
 
-    @router.callback_query(F.data == "main_menu")
-    async def cb_main_menu(callback: CallbackQuery) -> None:
-      await callback.answer()
-      try:
-          await callback.message.edit_text(  # type: ignore[union-attr]
-              "U0001f916 <b>ربات مدیریت گروه‌های تلگرام</b>\n\nانتخاب کنید:",
-              parse_mode="HTML",
-              reply_markup=main_menu_keyboard(),
-          )
-      except Exception:
-          pass
-    
+@router.callback_query(F.data == "sync_dialogs")
+async def cb_sync_dialogs(callback: CallbackQuery) -> None:
+    """همگام‌سازی گروه‌های تلگرام با دیتابیس."""
+    await callback.answer()
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "⏳ <b>در حال همگام‌سازی گروه‌ها...</b>\n\nلطفاً چند ثانیه صبر کنید.",
+            parse_mode="HTML",
+            reply_markup=_back_btn(),
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        new_count, total = await tg.sync_dialogs_to_db()
+        text = (
+            f"✅ <b>همگام‌سازی گروه‌ها کامل شد</b>\n\n"
+            f"📦 کل گروه‌ها: <code>{total}</code>\n"
+            f"🆕 جدید: <code>{new_count}</code>\n"
+            f"♻️ موجود: <code>{total - new_count}</code>"
+        )
+    except Exception as exc:
+        text = f"❌ <b>خطا:</b>\n<code>{str(exc)[:300]}</code>"
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            text, parse_mode="HTML", reply_markup=_back_btn(),
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "sync_users")
+async def cb_sync_users(callback: CallbackQuery) -> None:
+    """همگام‌سازی PVهای شخصی اکانت با دیتابیس."""
+    await callback.answer()
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "⏳ <b>در حال همگام‌سازی مخاطبین...</b>\n\nلطفاً چند ثانیه صبر کنید.",
+            parse_mode="HTML",
+            reply_markup=_back_btn(),
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        new_count, total = await tg.sync_user_dialogs_to_db()
+        text = (
+            f"✅ <b>همگام‌سازی مخاطبین کامل شد</b>\n\n"
+            f"📦 کل PVهای اکانت: <code>{total}</code>\n"
+            f"🆕 جدید اضافه شده: <code>{new_count}</code>\n"
+            f"♻️ موجود در دیتابیس: <code>{total - new_count}</code>"
+        )
+    except Exception as exc:
+        text = f"❌ <b>خطا:</b>\n<code>{str(exc)[:300]}</code>"
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            text, parse_mode="HTML", reply_markup=_back_btn(),
+        )
+    except Exception:
+        pass
