@@ -36,7 +36,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="▶️ شروع سیستم", callback_data="system_start"),
             InlineKeyboardButton(text="⏹ توقف سیستم", callback_data="system_stop"),
         ],
-        [InlineKeyboardButton(text="U0001f504 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
+        [InlineKeyboardButton(text="🔄 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
             InlineKeyboardButton(text="👥 همگام‌سازی مخاطبین", callback_data="sync_users")],
     ])
 
