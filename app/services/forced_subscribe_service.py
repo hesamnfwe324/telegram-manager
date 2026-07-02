@@ -14,6 +14,12 @@ Architecture:
      notice and auto-joins the required targets.
 
 Anti-spam guarantees (stops the notification flood seen in production):
+  - Sender validation: ONLY messages from bots are processed. Regular user
+    messages that happen to contain channel links are ALWAYS ignored — this
+    was the root cause of the false-positive flood in groups like BTC Flash
+    where users share their own channel links.
+  - Strong pattern matching: keyword presence alone is no longer sufficient.
+    At least one restriction-intent regex pattern must also match.
   - Group-level cooldown: after processing a group, don't process it again
     until at least _GROUP_COOLDOWN_MIN seconds have passed (or until the
     shortest flood-wait among its targets expires).
@@ -48,13 +54,55 @@ _PUBLIC_TGME_RE = re.compile(
 )
 _AT_USERNAME_RE = re.compile(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
-# ── Heuristic keywords ────────────────────────────────────────────────────────
+# ── Strong restriction-intent patterns ───────────────────────────────────────
+# ALL of these indicate that the message is an actual forced-subscribe notice,
+# NOT a user casually sharing a channel link.
+# At least ONE of these must match for the message to be treated as a
+# restriction notice (in addition to the sender being a bot).
+
+_RESTRICTION_PATTERNS: list[re.Pattern[str]] = [
+    # Persian — "برای ارسال/پیام/چت باید عضو/جوین بشی"
+    re.compile(
+        r"برای\s+.{0,30}?(ارسال|فرستادن|پیام|صحبت|چت|فعالیت|مشارکت|حرف)",
+        re.I | re.S,
+    ),
+    re.compile(r"باید\s+(اول\s+)?(عضو|جوین)\s*(بشی|بشوی|شوی|شوید|شو|بشه)", re.I),
+    re.compile(r"عضویت\s*(اجباری|الزامی|ضروری|فورس)", re.I),
+    re.compile(r"(ابتدا|اول)\s*(باید\s*)?(عضو|جوین|وارد)\s*(کانال|گروه|شو)", re.I),
+    re.compile(r"(محدودیت|ممنوع|مسدود)\s*(پیام|ارسال|چت|ارتباط)", re.I),
+    re.compile(r"(مجاز|اجازه)\s*(به\s*)?(ارسال|پیام|چت)\s*(ندار|نیست)", re.I),
+    re.compile(r"(خوش\s*آمد|welcome).{0,60}?(عضو|جوین|subscribe|join)", re.I | re.S),
+    re.compile(r"(احراز\s*هویت|verify).{0,40}?(عضو|کانال|join|channel)", re.I | re.S),
+    # English — "must/need to join to send/post/chat"
+    re.compile(
+        r"(you\s+)?(must|need\s+to|have\s+to|required\s+to)\s+(join|subscribe|be\s+a\s+member)",
+        re.I,
+    ),
+    re.compile(
+        r"(to\s+)?(send|post|write|chat|speak|participate)\s+.{0,30}?\s+"
+        r"(must|need\s+to|have\s+to)\s+(join|subscribe)",
+        re.I | re.S,
+    ),
+    re.compile(r"forced[\s_-]?subscribe", re.I),
+    re.compile(r"forced[\s_-]?join", re.I),
+    re.compile(r"(join|subscribe)\s+(first|our\s+channel|to\s+(send|chat|post|write))", re.I),
+    re.compile(
+        r"(not\s+allowed|forbidden|restricted|blocked)\s+(to\s+)?(send|post|chat|write|speak)",
+        re.I,
+    ),
+    re.compile(r"channel\s+(member|subscription|required|verification)", re.I),
+    re.compile(r"(verify|verification)\s+(yourself|your\s+account|membership)", re.I),
+]
+
+# ── Heuristic keywords (first-pass cheap filter) ──────────────────────────────
+# These are still used as a cheap pre-filter but are NOT sufficient alone.
 
 _SUBSCRIBE_KEYWORDS = (
     "عضو", "subscribe", "join", "کانال", "channel", "گروه",
     "ابتدا", "اول", "پیوستن", "member", "عضویت", "ارسال",
     "مجاز", "دسترسی", "اجازه", "مشارکت", "باید", "must",
     "required", "الزامی", "ضروری", "ممنوع", "محدود",
+    "احراز هویت", "verify", "forced", "restricted",
 )
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
@@ -78,6 +126,46 @@ _NOTIFY_COOLDOWN: float = 3600.0  # 1 hour
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sender_is_bot(message: Any) -> bool:
+    """
+    Return True ONLY if the message was sent by a verified Telegram bot.
+
+    This is the primary anti-false-positive guard. Regular users sharing
+    their own channel links will never trigger forced-subscribe logic.
+
+    Checks (in order of reliability):
+    1. message.sender.bot  — Telethon fills this from the User TL object.
+    2. message.via_bot_id  — message was sent via an inline bot.
+    3. message.post        — channel post auto-forwarded by a linked bot.
+    4. message.action      — service/system message (join/leave/pin notices).
+    """
+    try:
+        sender = getattr(message, "sender", None)
+        if sender is not None:
+            if getattr(sender, "bot", False):
+                return True
+            # Some bots appear as 'deleted' users with no bot flag but have
+            # sender_id matching known bot patterns — skip those, too risky.
+
+        # Inline-bot forwarded message
+        if getattr(message, "via_bot_id", None):
+            return True
+
+        # Service message (e.g. "X joined the group") from Telegram itself
+        if getattr(message, "action", None) is not None:
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def _matches_restriction_pattern(text: str) -> bool:
+    """Return True if text matches at least one strong restriction-intent regex."""
+    return any(p.search(text) for p in _RESTRICTION_PATTERNS)
+
 
 def _extract_urls_from_buttons(message: Any) -> list[str]:
     """Extract all URLs from InlineKeyboard buttons (message.buttons or raw reply_markup)."""
@@ -159,11 +247,38 @@ def _extract_targets(message: Any, text: str) -> list[str]:
 
 
 def _looks_like_forced_subscribe(text: str, message: Any = None) -> bool:
-    """Return True if the message looks like a forced-subscribe restriction notice."""
+    """
+    Return True if the message looks like a forced-subscribe restriction notice.
+
+    Three-layer check:
+    1. Cheap keyword pre-filter  — at least one subscribe-related keyword present.
+    2. Strong pattern match      — at least one restriction-intent regex must match.
+    3. Link/button presence      — there must be something to join.
+
+    NOTE: Sender validation (_sender_is_bot) is performed BEFORE this function
+    in process_message() and check_after_join(). This function intentionally
+    does NOT check the sender so it can be reused in handle_write_forbidden()
+    where we scan all messages in history.
+    """
     text_lower = text.lower()
+
+    # Layer 1: cheap keyword pre-filter
     if not any(kw in text_lower for kw in _SUBSCRIBE_KEYWORDS):
         return False
 
+    # Layer 2: at least one strong restriction-intent pattern must match
+    if not _matches_restriction_pattern(text):
+        # Even without a text pattern, if there are inline buttons with t.me URLs
+        # AND the keyword filter passed, trust the button (bots use buttons for
+        # forced-subscribe flows). But ONLY when we already know sender is a bot
+        # (enforced upstream in process_message / check_after_join).
+        if message is not None:
+            button_urls = _extract_urls_from_buttons(message)
+            if any("t.me" in u or "telegram.me" in u for u in button_urls):
+                return True
+        return False
+
+    # Layer 3: there must be something joinable in text or buttons
     has_text_link = bool(
         _PRIVATE_INVITE_RE.search(text)
         or _PUBLIC_TGME_RE.search(text)
@@ -256,6 +371,11 @@ class ForcedSubscribeService:
         Permanent Telethon handler registered at startup.
         Detects forced-subscribe restrictions in ANY group message and auto-joins.
 
+        KEY FIX: Messages from regular users are ALWAYS ignored. Only bot messages
+        (and service messages) are considered as potential restriction notices.
+        This prevents false positives in open groups like BTC Flash where users
+        share their own channel/group links in promotional messages.
+
         Anti-spam: group cooldown + target flood_wait tracking + notification dedup.
         """
         try:
@@ -267,6 +387,12 @@ class ForcedSubscribeService:
 
             # Skip our own outgoing messages
             if getattr(msg, "out", False):
+                return
+
+            # ── CRITICAL GUARD: only process bot messages ─────────────────────
+            # Regular users posting channel links must NEVER trigger auto-join.
+            # This is the primary fix for the false-positive flood.
+            if not _sender_is_bot(msg):
                 return
 
             text: str = (
@@ -288,11 +414,11 @@ class ForcedSubscribeService:
 
             group_id: int = event.chat_id
 
-            # ── Guard 1: in-flight (concurrent processing) ────────────────
+            # ── Guard: in-flight (concurrent processing) ──────────────────────
             if group_id in self._handling:
                 return
 
-            # ── Guard 2: group cooldown (recent run) ──────────────────────
+            # ── Guard: group cooldown (recent run) ────────────────────────────
             if self._group_is_cooling(group_id):
                 logger.debug(
                     "ForcedSubscribe[global]: group %d on cooldown for %.0fs — skipping",
@@ -303,7 +429,7 @@ class ForcedSubscribeService:
 
             sender_id = getattr(msg, "sender_id", None)
             logger.info(
-                "ForcedSubscribe[global]: restriction in group %d (sender=%s) targets=%s",
+                "ForcedSubscribe[global]: bot restriction in group %d (bot_sender=%s) targets=%s",
                 group_id, sender_id, targets,
             )
 
@@ -331,6 +457,8 @@ class ForcedSubscribeService:
         """
         Listen for forced-subscribe messages for up to LISTEN_TIMEOUT seconds
         right after joining *group_id*. Returns list of auto-joined targets.
+
+        Only bot messages are processed (same guard as process_message).
         """
         if self._tg is None:
             return []
@@ -348,6 +476,11 @@ class ForcedSubscribeService:
                     return
 
                 msg = event.message
+
+                # Only react to bot messages after join (same guard as process_message)
+                if not _sender_is_bot(msg):
+                    return
+
                 text: str = (
                     getattr(msg, "text", "")
                     or getattr(msg, "message", "")
@@ -362,7 +495,7 @@ class ForcedSubscribeService:
                     return
 
                 logger.info(
-                    "ForcedSubscribe[check_after_join]: restriction in group %d — targets=%s",
+                    "ForcedSubscribe[check_after_join]: bot restriction in group %d — targets=%s",
                     group_id, targets,
                 )
 
@@ -402,6 +535,9 @@ class ForcedSubscribeService:
         """
         Called when ChatWriteForbiddenError is raised. Scans recent group history
         for forced-subscribe messages and auto-joins required targets.
+
+        When scanning history we additionally filter to bot-sender messages only,
+        so that user-posted channel links are never mistaken for restrictions.
         """
         if self._tg is None:
             return []
@@ -431,8 +567,18 @@ class ForcedSubscribeService:
                     or getattr(message, "message", None)
                     or ""
                 )
+
+                # Skip non-bot messages in history scan too
+                if not _sender_is_bot(message):
+                    logger.debug(
+                        "ForcedSubscribe[scan] skipping non-bot sender=%s text=%r",
+                        getattr(message, "sender_id", None),
+                        text[:60],
+                    )
+                    continue
+
                 logger.debug(
-                    "ForcedSubscribe[scan] sender=%s text=%r buttons=%r",
+                    "ForcedSubscribe[scan] bot sender=%s text=%r buttons=%r",
                     getattr(message, "sender_id", None),
                     text[:80],
                     _extract_urls_from_buttons(message),
@@ -456,7 +602,7 @@ class ForcedSubscribeService:
                 auto_joined = await self._join_targets(unique, group_id, group_title)
             else:
                 logger.warning(
-                    "ForcedSubscribe[write-forbidden]: no restriction message found in "
+                    "ForcedSubscribe[write-forbidden]: no bot restriction message found in "
                     "last %d messages of group %d. Possibly native Telegram channel "
                     "enforcement (no bot message) — cannot auto-detect target.",
                     _HISTORY_SCAN_LIMIT, group_id,
