@@ -407,18 +407,16 @@ class BroadcastQueueService:
             group_link = group.get("invite_link") or (
                 f"@{group['username']}" if group.get("username") else None
             )
-            ok, reason = await self._tg_call(
-                tg.forward_message_to_group(
-                    group_id=group_id,
-                    group_link=group_link,
-                    message_text=job.message_text,
-                    media_file_id=job.media_file_id,
-                    media_type=job.media_type,
-                    is_forward=job.is_forward,
-                    forward_from_chat_id=job.forward_from_chat_id,
-                    forward_from_message_id=job.forward_from_message_id,
-                    bot=job.bot,
-                )
+            ok, reason = await tg.forward_message_to_group(
+                group_id=group_id,
+                group_link=group_link,
+                message_text=job.message_text,
+                media_file_id=job.media_file_id,
+                media_type=job.media_type,
+                is_forward=job.is_forward,
+                forward_from_chat_id=job.forward_from_chat_id,
+                forward_from_message_id=job.forward_from_message_id,
+                bot=job.bot,
             )
             if ok:
                 job.success += 1
