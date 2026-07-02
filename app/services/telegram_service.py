@@ -345,18 +345,25 @@ class TelegramUserService:
         """
         try:
             # --- Resolve destination group entity ---
-            dest_entity: Any
-            if group_link:
-                try:
-                    dest_entity = await self.client.get_entity(group_link)
-                except Exception as link_exc:
-                    logger.warning(
-                        "Cannot resolve group via link %s: %s — falling back to group_id %d",
-                        group_link, link_exc, group_id,
-                    )
-                    dest_entity = group_id
-            else:
-                dest_entity = group_id
+              # Always resolve to a proper entity (carries access_hash).
+              # Raw integer peer IDs cause "invalid peer" for supergroups not in cache.
+              dest_entity: Any = None
+              if group_link:
+                  try:
+                      dest_entity = await self.client.get_entity(group_link)
+                  except Exception as link_exc:
+                      logger.warning(
+                          "Cannot resolve group via link %s: %s — falling back to ID",
+                          group_link, link_exc,
+                      )
+              if dest_entity is None:
+                  try:
+                      dest_entity = await self.client.get_entity(group_id)
+                  except Exception as id_exc:
+                      logger.warning(
+                          "Cannot resolve entity for group_id %d: %s", group_id, id_exc
+                      )
+                      return False, f"entity_not_found: {id_exc}"
 
             # ----------------------------------------------------------------
             # Path 1: TRUE FORWARD — use Telethon forward_messages so the
@@ -616,6 +623,76 @@ class TelegramUserService:
           except Exception as exc:
               logger.error("Failed to send DM to user %d: %s", user_id, exc, exc_info=True)
               return False, str(exc)[:120]
+
+          async def get_all_groups_from_dialogs(self, limit: int = 3000) -> list[dict]:
+          """Return all groups/supergroups the account is in, from live Telethon dialogs.
+
+          Ground truth for broadcast — every group the account is currently a member of,
+          not just those stored in the DB. Entities carry access_hash so no
+          'invalid peer' errors occur during sending.
+          """
+          try:
+              dialogs = await asyncio.wait_for(
+                  self.client.get_dialogs(limit=limit),
+                  timeout=60.0,
+              )
+          except asyncio.TimeoutError:
+              logger.warning("get_all_groups_from_dialogs timed out after 60s")
+              dialogs = []
+          except Exception as exc:
+              logger.warning("get_all_groups_from_dialogs failed: %s", exc)
+              dialogs = []
+
+          groups: list[dict] = []
+          for d in dialogs:
+              entity = d.entity
+              if isinstance(entity, Chat):
+                  groups.append({
+                      "group_id": d.id,
+                      "title": entity.title,
+                      "username": None,
+                      "members_count": getattr(entity, "participants_count", None),
+                  })
+              elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
+                  groups.append({
+                      "group_id": d.id,
+                      "title": entity.title,
+                      "username": getattr(entity, "username", None),
+                      "members_count": getattr(entity, "participants_count", None),
+                  })
+          logger.info("get_all_groups_from_dialogs: %d groups found", len(groups))
+          return groups
+
+      async def sync_dialogs_to_db(self) -> tuple[int, int]:
+          """Sync all live Telethon group dialogs into the DB as JOINED groups.
+
+          Returns (new_count, total_count).
+          """
+          from datetime import datetime, timezone
+          from app.database.connection import AsyncSessionLocal
+          from app.repositories import GroupRepository
+          from app.models.group import GroupStatus
+
+          all_groups = await self.get_all_groups_from_dialogs()
+          new_count = 0
+
+          async with AsyncSessionLocal() as session:
+              repo = GroupRepository(session)
+              for g in all_groups:
+                  _, created = await repo.upsert(
+                      group_id=g["group_id"],
+                      title=g["title"],
+                      username=g.get("username"),
+                      members_count=g.get("members_count"),
+                      status=GroupStatus.JOINED,
+                      join_date=datetime.now(timezone.utc),
+                  )
+                  if created:
+                      new_count += 1
+              await session.commit()
+
+          logger.info("sync_dialogs_to_db: %d total, %d new", len(all_groups), new_count)
+          return new_count, len(all_groups)
 
           async def get_session_string(self) -> str:
         if isinstance(self.client.session, StringSession):
