@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.contacted_user import ContactedUser
@@ -71,3 +71,23 @@ class ContactedUserRepository(BaseRepository[ContactedUser]):
             .where(ContactedUser.is_blocked.is_(False))
         )
         return result.scalar_one()
+
+    async def prune_not_in(self, active_user_ids: set[int]) -> int:
+        """Mark as is_blocked=True every ContactedUser whose user_id is NOT in
+        active_user_ids.  Returns the number of rows updated.
+
+        Call this after a fresh sync so the DB always reflects exactly who is
+        currently in the account's PV dialogs — no stale/old records pollute
+        broadcast counts.
+        """
+        if not active_user_ids:
+            # Safety guard: never wipe everyone if the live list came back empty
+            return 0
+
+        result = await self._session.execute(
+            update(ContactedUser)
+            .where(ContactedUser.user_id.not_in(active_user_ids))
+            .where(ContactedUser.is_blocked.is_(False))
+            .values(is_blocked=True)
+        )
+        return result.rowcount

@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from app.database.connection import AsyncSessionLocal
-from app.repositories import GroupRepository, ContactedUserRepository
+from app.repositories import GroupRepository
 from app.models.group import GroupStatus
 from app.services.broadcast_queue_service import BroadcastQueueService
 from app.utils.logger import get_logger
@@ -139,12 +139,17 @@ async def receive_content(message: Message, state: FSMContext) -> None:
     target = data.get("target", "groups")
     label = "گروه‌ها" if target == "groups" else "کاربران"
 
-    async with AsyncSessionLocal() as session:
-        if target == "groups":
+    if target == "groups":
+        async with AsyncSessionLocal() as session:
             count = await GroupRepository(session).count_by_status(GroupStatus.JOINED)
-        else:
-            users = await ContactedUserRepository(session).get_active(limit=100000)
-            count = len(users)
+    else:
+        # Use live PV dialogs as the count — identical to what _send_to_users will
+        # actually send to.  DB count is intentionally NOT used here because the DB
+        # may contain stale records from previous sessions that inflate the number.
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        live_users = await tg.get_all_user_dialogs()
+        count = len(live_users)
 
     # Build a human-readable description of what will be sent
     if is_forward and forward_from_chat_id and forward_from_message_id:

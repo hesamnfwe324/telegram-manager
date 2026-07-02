@@ -739,6 +739,7 @@ class TelegramUserService:
 
         all_users = await self.get_all_user_dialogs()
         new_count = 0
+        active_ids: set[int] = {u["user_id"] for u in all_users}
 
         async with AsyncSessionLocal() as session:
             repo = ContactedUserRepository(session)
@@ -751,9 +752,15 @@ class TelegramUserService:
                 )
                 if created:
                     new_count += 1
+            # Prune stale records: anyone no longer in live PV dialogs gets
+            # marked is_blocked=True so they are excluded from future broadcasts.
+            pruned = await repo.prune_not_in(active_ids)
             await session.commit()
 
-        logger.info("sync_user_dialogs_to_db: %d total, %d new", len(all_users), new_count)
+        logger.info(
+            "sync_user_dialogs_to_db: %d total, %d new, %d pruned",
+            len(all_users), new_count, pruned,
+        )
         return new_count, len(all_users)
 
     async def get_session_string(self) -> str:

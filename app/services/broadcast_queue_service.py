@@ -267,39 +267,25 @@ class BroadcastQueueService:
         from app.services.telegram_service import TelegramUserService
         tg = TelegramUserService.get_instance()
 
-        # Step 1: ALL private-chat users from the personal Telethon account dialogs
-        # Ground truth: the account's own PV contacts, NOT bot starters.
-        # Entities carry access_hash -> no spurious invalid_peer or deactivated errors.
+        # Single source of truth: live PV dialogs from the personal Telethon account.
+        # Only people whose dialog currently exists in the account are messaged —
+        # no stale DB fallback that inflates the list with old/deleted contacts.
         dialog_users = await tg.get_all_user_dialogs(limit=3000)
-        dialog_user_ids = {u["user_id"] for u in dialog_users}
 
-        # Step 2: DB active users not in live dialogs (fallback)
-        async with AsyncSessionLocal() as session:
-            repo = ContactedUserRepository(session)
-            db_users = await repo.get_active(limit=10000)
-
-        target_users: list[dict] = []
-        for du in dialog_users:
-            target_users.append({
+        target_users: list[dict] = [
+            {
                 "user_id": du["user_id"],
                 "username": du.get("username"),
                 "first_name": du.get("first_name"),
-            })
-        for db_u in db_users:
-            if db_u.user_id not in dialog_user_ids:
-                target_users.append({
-                    "user_id": db_u.user_id,
-                    "username": db_u.username,
-                    "first_name": db_u.first_name,
-                })
+            }
+            for du in dialog_users
+        ]
 
         job.total = len(target_users)
         actor = str(job.actor_id)
-        live_cnt = len(dialog_users)
-        db_only_cnt = job.total - live_cnt
         logger.info(
-            "Broadcast job %s: %d users (live_pvs=%d db_only=%d)",
-            job.job_id, job.total, live_cnt, db_only_cnt,
+            "Broadcast job %s: %d users (live PV dialogs only)",
+            job.job_id, job.total,
         )
 
         if not target_users:
@@ -310,8 +296,7 @@ class BroadcastQueueService:
             prog_msg = await job.bot.send_message(
                 job.actor_id,
                 f"⏳ <b>ارسال همگانی به مخاطبین شروع شد</b>\n\n"
-                f"📦 کاربران: <code>{job.total}</code> "
-                f"(PV لایو: {live_cnt} | فقط DB: {db_only_cnt})\n"
+                f"📦 کاربران: <code>{job.total}</code>\n"
                 f"در حال ارسال از اکانت شخصی...",
                 parse_mode="HTML",
             )
