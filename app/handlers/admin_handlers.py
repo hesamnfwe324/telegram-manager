@@ -108,6 +108,41 @@ async def cmd_broadcast_status(message: Message) -> None:
     )
 
 
+
+
+@router.message(Command("queue_status"))
+async def cmd_queue_status(message: Message) -> None:
+    """نمایش وضعیت صف عضویت گروه‌ها."""
+    from app.services.join_queue_service import JoinQueueService
+    from app.database.connection import AsyncSessionLocal
+    from app.repositories.join_attempt_repository import JoinAttemptRepository
+
+    jq = JoinQueueService.get_instance()
+    queue_size = jq.queue_size()
+
+    async with AsyncSessionLocal() as session:
+        attempt_repo = JoinAttemptRepository(session)
+        today_count = await attempt_repo.count_today()
+
+    delay_min = 7
+    eta_minutes = queue_size * delay_min
+    if eta_minutes >= 60:
+        eta_str = f"{eta_minutes // 60} ساعت و {eta_minutes % 60} دقیقه"
+    else:
+        eta_str = f"{eta_minutes} دقیقه"
+
+    status_icon = "⏳" if queue_size > 0 else "✅"
+
+    await message.answer(
+        f"📋 <b>وضعیت صف عضویت</b>\n\n"
+        f"{status_icon} در صف: <code>{queue_size}</code> گروه\n"
+        f"✅ عضو شده امروز: <code>{today_count}</code> گروه\n"
+        f"⏱ زمان تخمینی تمام شدن صف: <b>{eta_str}</b>\n"
+        f"⚙️ تأخیر بین هر عضویت: <code>{delay_min} دقیقه</code>",
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data == "system_health")
 async def cb_system_health(callback: CallbackQuery) -> None:
     await callback.answer()
