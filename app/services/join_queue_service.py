@@ -184,45 +184,6 @@ class JoinQueueService:
             )
             return
 
-        # Check daily rate limit
-        async with AsyncSessionLocal() as session:
-            attempt_repo = JoinAttemptRepository(session)
-            today_count = await attempt_repo.count_today()
-
-        if today_count >= settings.MAX_JOINS_PER_DAY:
-            # ── Daily limit hit: sleep until next UTC midnight, then resume ──────
-            # BUG (old): sleeping 300 s per task caused every task in the queue to
-            # cycle through a 5-minute wait with NO actual joins (30 tasks × 300 s
-            # = 2.5 h of pointless spinning).
-            # FIX (new): block the consume loop ONCE until tomorrow 00:00 UTC so
-            # all remaining tasks resume cleanly the next day without cycling.
-            now_utc = datetime.now(timezone.utc)
-            tomorrow = (now_utc + timedelta(days=1)).replace(
-                hour=0, minute=1, second=0, microsecond=0
-            )
-            sleep_secs = max(60.0, (tomorrow - now_utc).total_seconds())
-            logger.warning(
-                "Daily join limit (%d) reached — sleeping %.0fs (~%.1fh) until "
-                "00:01 UTC tomorrow, then resuming queue (group_id=%d is safe in queue)",
-                settings.MAX_JOINS_PER_DAY,
-                sleep_secs,
-                sleep_secs / 3600,
-                task.group_id,
-            )
-            # Notify admins once so they know the queue is paused
-            try:
-                from app.services.notification_service import NotificationService
-                await NotificationService.get_instance().notify_info(
-                    f"⏸ سقف روزانه عضویت ({settings.MAX_JOINS_PER_DAY} گروه) تمام شد.\n"
-                    f"📋 {self._queue.qsize() + 1} گروه در صف — ادامه فردا ساعت ۰۰:۰۱ UTC"
-                )
-            except Exception:
-                pass
-            # Put current task back so it's not lost, then sleep
-            self._queued_ids.add(task.group_id)
-            await self._queue.put(task)
-            await asyncio.sleep(sleep_secs)
-            return
 
         # Exact 7-minute delay between joins (anti-detection, configurable via env)
         delay = random.uniform(settings.JOIN_DELAY_MIN, settings.JOIN_DELAY_MAX)
