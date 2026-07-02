@@ -310,7 +310,7 @@ class BroadcastQueueService:
             prog_msg = await job.bot.send_message(
                 job.actor_id,
                 f"⏳ <b>ارسال همگانی به مخاطبین شروع شد</b>\n\n"
-                f"U0001f4e6 کاربران: <code>{job.total}</code> "
+                f"📦 کاربران: <code>{job.total}</code> "
                 f"(PV لایو: {live_cnt} | فقط DB: {db_only_cnt})\n"
                 f"در حال ارسال از اکانت شخصی...",
                 parse_mode="HTML",
@@ -365,116 +365,116 @@ class BroadcastQueueService:
             await asyncio.sleep(TG_DM_DELAY)
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
-          from app.services.telegram_service import TelegramUserService
-          tg = TelegramUserService.get_instance()
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
 
-          # ── Step 1: Live Telethon dialogs — ALL groups the account is in ──────────
-          # Ground truth. Entities carry access_hash → no invalid peer errors.
-          dialog_groups = await tg.get_all_groups_from_dialogs(limit=3000)
-          dialog_ids = {g["group_id"] for g in dialog_groups}
+        # ── Step 1: Live Telethon dialogs — ALL groups the account is in ──────────
+        # Ground truth. Entities carry access_hash → no invalid peer errors.
+        dialog_groups = await tg.get_all_groups_from_dialogs(limit=3000)
+        dialog_ids = {g["group_id"] for g in dialog_groups}
 
-          # ── Step 2: DB-only joined groups not in live dialogs (edge cases) ────
-          async with AsyncSessionLocal() as session:
-              repo = GroupRepository(session)
-              db_groups = await repo.get_joined()
-          db_by_id = {g.group_id: g for g in db_groups}
+        # ── Step 2: DB-only joined groups not in live dialogs (edge cases) ────
+        async with AsyncSessionLocal() as session:
+            repo = GroupRepository(session)
+            db_groups = await repo.get_joined()
+        db_by_id = {g.group_id: g for g in db_groups}
 
-          target_groups: list[dict] = []
-          for dg in dialog_groups:
-              db_g = db_by_id.get(dg["group_id"])
-              target_groups.append({
-                  "group_id": dg["group_id"],
-                  "title": dg["title"],
-                  "invite_link": db_g.invite_link if db_g else None,
-                  "username": dg.get("username"),
-              })
-          for db_g in db_groups:
-              if db_g.group_id not in dialog_ids:
-                  target_groups.append({
-                      "group_id": db_g.group_id,
-                      "title": db_g.title,
-                      "invite_link": db_g.invite_link,
-                      "username": db_g.username,
-                  })
+        target_groups: list[dict] = []
+        for dg in dialog_groups:
+            db_g = db_by_id.get(dg["group_id"])
+            target_groups.append({
+                "group_id": dg["group_id"],
+                "title": dg["title"],
+                "invite_link": db_g.invite_link if db_g else None,
+                "username": dg.get("username"),
+            })
+        for db_g in db_groups:
+            if db_g.group_id not in dialog_ids:
+                target_groups.append({
+                    "group_id": db_g.group_id,
+                    "title": db_g.title,
+                    "invite_link": db_g.invite_link,
+                    "username": db_g.username,
+                })
 
-          job.total = len(target_groups)
-          actor = str(job.actor_id)
-          live_cnt = len(dialog_groups)
-          db_only_cnt = job.total - live_cnt
-          logger.info(
-              "Broadcast job %s: %d groups (live=%d db_only=%d)",
-              job.job_id, job.total, live_cnt, db_only_cnt,
-          )
+        job.total = len(target_groups)
+        actor = str(job.actor_id)
+        live_cnt = len(dialog_groups)
+        db_only_cnt = job.total - live_cnt
+        logger.info(
+            "Broadcast job %s: %d groups (live=%d db_only=%d)",
+            job.job_id, job.total, live_cnt, db_only_cnt,
+        )
 
-          try:
-              prog_msg = await job.bot.send_message(
-                  job.actor_id,
-                  f"⏳ <b>ارسال همگانی به گروه‌ها شروع شد</b>\n\n"
-                  f"U0001f4e6 کل: <code>{job.total}</code> (لایو: {live_cnt} | فقط DB: {db_only_cnt})\nدر حال ارسال...",
-                  parse_mode="HTML",
-              )
-              job.progress_message_id = prog_msg.message_id
-          except Exception as exc:
-              logger.warning("Could not send initial progress message: %s", exc)
+        try:
+            prog_msg = await job.bot.send_message(
+                job.actor_id,
+                f"⏳ <b>ارسال همگانی به گروه‌ها شروع شد</b>\n\n"
+                f"📦 کل: <code>{job.total}</code> (لایو: {live_cnt} | فقط DB: {db_only_cnt})\nدر حال ارسال...",
+                parse_mode="HTML",
+            )
+            job.progress_message_id = prog_msg.message_id
+        except Exception as exc:
+            logger.warning("Could not send initial progress message: %s", exc)
 
-          for idx, group in enumerate(target_groups):
-              group_id = group["group_id"]
-              group_link = group.get("invite_link") or (
-                  f"@{group['username']}" if group.get("username") else None
-              )
-              ok, reason = await self._tg_call(
-                  tg.forward_message_to_group(
-                      group_id=group_id,
-                      group_link=group_link,
-                      message_text=job.message_text,
-                      media_file_id=job.media_file_id,
-                      media_type=job.media_type,
-                      is_forward=job.is_forward,
-                      forward_from_chat_id=job.forward_from_chat_id,
-                      forward_from_message_id=job.forward_from_message_id,
-                      bot=job.bot,
-                  )
-              )
-              if ok:
-                  job.success += 1
-                  await self._log("broadcast_group_sent", "success", actor, str(group_id))
-              else:
-                  job.failed += 1
-                  if job.first_group_error is None:
-                      job.first_group_error = f"gid={group_id}: {reason}"
-                  await self._log("broadcast_group_failed", "error", actor, str(group_id), reason)
+        for idx, group in enumerate(target_groups):
+            group_id = group["group_id"]
+            group_link = group.get("invite_link") or (
+                f"@{group['username']}" if group.get("username") else None
+            )
+            ok, reason = await self._tg_call(
+                tg.forward_message_to_group(
+                    group_id=group_id,
+                    group_link=group_link,
+                    message_text=job.message_text,
+                    media_file_id=job.media_file_id,
+                    media_type=job.media_type,
+                    is_forward=job.is_forward,
+                    forward_from_chat_id=job.forward_from_chat_id,
+                    forward_from_message_id=job.forward_from_message_id,
+                    bot=job.bot,
+                )
+            )
+            if ok:
+                job.success += 1
+                await self._log("broadcast_group_sent", "success", actor, str(group_id))
+            else:
+                job.failed += 1
+                if job.first_group_error is None:
+                    job.first_group_error = f"gid={group_id}: {reason}"
+                await self._log("broadcast_group_failed", "error", actor, str(group_id), reason)
 
-              done_count = idx + 1
-              if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
-                  await self._send_progress(job, done_count)
-              await asyncio.sleep(GROUP_DELAY)
+            done_count = idx + 1
+            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
+                await self._send_progress(job, done_count)
+            await asyncio.sleep(GROUP_DELAY)
 
     # ══════════════════════════════════════════════════════════════════
     # HELPERS
     # ══════════════════════════════════════════════════════════════════
 
     async def _send_progress(self, job: BroadcastJob, done: int) -> None:
-          """Edit the single live-progress message instead of flooding new ones."""
-          try:
-              pct = int(done / job.total * 100) if job.total else 0
-              text = (
-                  f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
-                  f"✅ موفق: <code>{job.success}</code>\n"
-                  f"❌ ناموفق: <code>{job.failed}</code>\n"
-                  f"📦 {done} از {job.total}"
-              )
-              if job.progress_message_id:
-                  await job.bot.edit_message_text(
-                      chat_id=job.actor_id,
-                      message_id=job.progress_message_id,
-                      text=text,
-                      parse_mode="HTML",
-                  )
-              else:
-                  msg = await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
-                  job.progress_message_id = msg.message_id
-          except Exception:
-              pass
+        """Edit the single live-progress message instead of flooding new ones."""
+        try:
+            pct = int(done / job.total * 100) if job.total else 0
+            text = (
+                f"⏳ <b>ارسال همگانی در حال اجرا</b> ({pct}%)\n\n"
+                f"✅ موفق: <code>{job.success}</code>\n"
+                f"❌ ناموفق: <code>{job.failed}</code>\n"
+                f"📦 {done} از {job.total}"
+            )
+            if job.progress_message_id:
+                await job.bot.edit_message_text(
+                    chat_id=job.actor_id,
+                    message_id=job.progress_message_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+            else:
+                msg = await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+                job.progress_message_id = msg.message_id
+        except Exception:
+            pass
     async def _mark_user_blocked(self, user_id: int) -> None:
         try:
             async with AsyncSessionLocal() as s:
@@ -526,19 +526,19 @@ class BroadcastQueueService:
                 text += f"\n\n🔍 اولین خطای گروه: <code>{job.first_group_error[:200]}</code>"
 
             # Edit the live-progress message with the final result
-              if job.progress_message_id:
-                  try:
-                      await job.bot.edit_message_text(
-                          chat_id=job.actor_id,
-                          message_id=job.progress_message_id,
-                          text=text,
-                          parse_mode="HTML",
-                      )
-                  except Exception:
-                      await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
-              else:
-                  await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
-              for admin_id in settings.get_admin_id_list():
+            if job.progress_message_id:
+                try:
+                    await job.bot.edit_message_text(
+                        chat_id=job.actor_id,
+                        message_id=job.progress_message_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+            else:
+                await job.bot.send_message(job.actor_id, text, parse_mode="HTML")
+            for admin_id in settings.get_admin_id_list():
                 if admin_id != job.actor_id:
                     try:
                         await job.bot.send_message(admin_id, text, parse_mode="HTML")
