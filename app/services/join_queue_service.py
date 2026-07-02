@@ -214,6 +214,41 @@ class JoinQueueService:
 
         success, real_group_id, join_error = await self._tg.join_group(task.link)
 
+        # ── Handle FloodWait: re-queue with delay instead of marking FAILED ──────
+        # join_group now returns immediately on FloodWait (no sleep inside).
+        # We parse the wait time and schedule a background re-enqueue so the
+        # group is retried after Telegram's cooling period — never marked FAILED.
+        if not success and join_error and join_error.startswith("flood_wait:"):
+            try:
+                wait_secs = int(join_error.split(":")[1].rstrip("s"))
+            except (IndexError, ValueError):
+                wait_secs = 3600  # safe fallback: 1 hour
+
+            logger.warning(
+                "FloodWait for group_id=%d (%r): scheduling retry in %d seconds (~%.1fh)",
+                task.group_id, task.title, wait_secs, wait_secs / 3600,
+            )
+
+            async def _requeue_after_flood(t: "JoinTask", delay: int) -> None:
+                await asyncio.sleep(delay)
+                logger.info(
+                    "FloodWait expired — re-enqueuing group_id=%d (%r)",
+                    t.group_id, t.title,
+                )
+                await self.enqueue(
+                    group_id=t.group_id,
+                    link=t.link,
+                    title=t.title,
+                    attempt=t.attempt_number,
+                )
+
+            asyncio.create_task(
+                _requeue_after_flood(task, wait_secs),
+                name=f"flood-requeue-{task.group_id}",
+            )
+            # Keep DB status as PENDING — group is not failed, just rate-limited
+            return
+
         async with AsyncSessionLocal() as session:
             group_repo = GroupRepository(session)
             log_repo = LogRepository(session)

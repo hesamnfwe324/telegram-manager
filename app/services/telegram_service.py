@@ -226,9 +226,12 @@ class TelegramUserService:
             logger.info("Join request sent (pending admin approval): %s", link)
             return True, None, "request_pending_approval"
         except FloodWaitError as exc:
-            logger.warning("FloodWait joining %s: wait %d seconds", link, exc.seconds)
-            await asyncio.sleep(exc.seconds)
-            return False, None, f"FloodWaitError:{exc.seconds}s"
+            logger.warning(
+                "FloodWait joining %s: Telegram requires waiting %d seconds (~%.1fh). "
+                "Returning immediately — caller will schedule retry.",
+                link, exc.seconds, exc.seconds / 3600,
+            )
+            return False, None, f"flood_wait:{exc.seconds}s"
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             logger.error("Failed to join %s: %s", link, err)
@@ -239,8 +242,10 @@ class TelegramUserService:
             await self.client.send_message(group_id, message)
             return True
         except FloodWaitError as exc:
-            logger.warning("FloodWait sending to %d: wait %d seconds", group_id, exc.seconds)
-            await asyncio.sleep(exc.seconds)
+            logger.warning(
+                "FloodWait sending to group %d: wait %d seconds — returning immediately",
+                group_id, exc.seconds,
+            )
             return False
         except Exception as exc:
             logger.error("Failed to send to %d: %s", group_id, exc)
@@ -256,13 +261,15 @@ class TelegramUserService:
         except InputUserDeactivatedError:
             return False, "deactivated"
         except PeerFloodError:
-            logger.warning("PeerFlood — too many DMs sent, slowing down")
+            logger.warning("PeerFlood — too many DMs sent; backing off 60s")
             await asyncio.sleep(60)
             return False, "peer_flood"
         except FloodWaitError as exc:
-            logger.warning("FloodWait sending DM to %d: wait %d seconds", user_id, exc.seconds)
-            await asyncio.sleep(exc.seconds)
-            return False, "flood_wait"
+            logger.warning(
+                "FloodWait sending DM to %d: wait %d seconds — returning immediately",
+                user_id, exc.seconds,
+            )
+            return False, f"flood_wait:{exc.seconds}s"
         except Exception as exc:
             logger.error("Failed to send DM to %d: %s", user_id, exc)
             return False, str(exc)
@@ -279,13 +286,15 @@ class TelegramUserService:
         except InputUserDeactivatedError:
             return False, "deactivated"
         except PeerFloodError:
-            logger.warning("PeerFlood — too many DMs sent, slowing down")
+            logger.warning("PeerFlood forwarding — backing off 60s")
             await asyncio.sleep(60)
             return False, "peer_flood"
         except FloodWaitError as exc:
-            logger.warning("FloodWait forwarding to %d: wait %d seconds", user_id, exc.seconds)
-            await asyncio.sleep(exc.seconds)
-            return False, "flood_wait"
+            logger.warning(
+                "FloodWait forwarding to %d: wait %d seconds — returning immediately",
+                user_id, exc.seconds,
+            )
+            return False, f"flood_wait:{exc.seconds}s"
         except Exception as exc:
             logger.error("Failed to forward to %d: %s", user_id, exc)
             return False, str(exc)
@@ -310,8 +319,11 @@ class TelegramUserService:
         except InputUserDeactivatedError:
             return False, "deactivated"
         except FloodWaitError as exc:
-            await asyncio.sleep(exc.seconds)
-            return False, "flood_wait"
+            logger.warning(
+                "FloodWait sending media to user %d: wait %d seconds — returning immediately",
+                user_id, exc.seconds,
+            )
+            return False, f"flood_wait:{exc.seconds}s"
         except Exception as exc:
             logger.error("Failed to send media to user %d: %s", user_id, exc)
             return False, str(exc)

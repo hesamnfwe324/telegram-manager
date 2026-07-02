@@ -243,9 +243,21 @@ async def main() -> None:
     asyncio.create_task(_start_client_safe())
     scheduler.start()
 
+    # Delete any stale webhook so polling does not conflict with a previous
+    # Render deployment that set a webhook or left a getUpdates session open.
+    # This must run BEFORE start_polling or Telegram returns ConflictError.
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Webhook cleared — ready for polling")
+    except Exception as _wh_exc:
+        logger.warning("Could not clear webhook (non-fatal): %s", _wh_exc)
+
     logger.info("Bot polling started")
     polling_task = asyncio.create_task(
-        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
     )
     shutdown_task = asyncio.create_task(_shutdown_event.wait())
 
