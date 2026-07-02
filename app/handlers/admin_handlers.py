@@ -108,12 +108,6 @@ async def cmd_broadcast_status(message: Message) -> None:
     )
 
 
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery) -> None:
-    await _safe_edit(callback, "منوی اصلی:", reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-
 @router.callback_query(F.data == "system_health")
 async def cb_system_health(callback: CallbackQuery) -> None:
     await callback.answer()
