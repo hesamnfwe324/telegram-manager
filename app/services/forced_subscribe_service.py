@@ -220,7 +220,16 @@ class ForcedSubscribeService:
         - Missing a valid detection is worse than a false positive
         """
         try:
+            # Only act in group/supergroup chats — never in DMs or channels
+            if not event.is_group:
+                return
+
             msg = event.message
+
+            # Skip our own outgoing messages
+            if getattr(msg, "out", False):
+                return
+
             text: str = (
                 getattr(msg, "text", "")
                 or getattr(msg, "message", "")
