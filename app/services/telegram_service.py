@@ -521,7 +521,7 @@ class TelegramUserService:
         self.client.add_event_handler(handler, events.ChatAction())
 
 
-      async def send_dm_to_user(
+    async def send_dm_to_user(
           self,
           user_id: int,
           message_text: str = "",
@@ -543,16 +543,20 @@ class TelegramUserService:
             'peer_flood'      — too many DMs, account temporarily restricted
             or raw exception string for unexpected errors.
           """
+          from telethon.errors.rpcerrorlist import (
+              PeerIdInvalidError,
+              UsernameInvalidError,
+              UsernameNotOccupiedError,
+          )
+
           try:
               # Resolve the user entity — Telethon caches access_hash after any
               # shared-group interaction, so this succeeds for contacts seen before.
               try:
                   entity = await self.client.get_input_entity(user_id)
-              except Exception as resolve_exc:
-                  exc_str = str(resolve_exc).lower()
-                  if any(k in exc_str for k in ("peer id", "invalid", "no access", "cannot find", "no user")):
-                      return False, "peer_not_found"
-                  raise  # unexpected — propagate to outer handler
+              except (PeerIdInvalidError, UsernameInvalidError,
+                      UsernameNotOccupiedError, ValueError, KeyError):
+                  return False, "peer_not_found"
 
               # ── Path 1: FORWARD (preserves "Forwarded from …" header) ──────────
               if is_forward and forward_from_chat_id and forward_from_message_id:
@@ -613,7 +617,7 @@ class TelegramUserService:
               logger.error("Failed to send DM to user %d: %s", user_id, exc, exc_info=True)
               return False, str(exc)[:120]
 
-        async def get_session_string(self) -> str:
+          async def get_session_string(self) -> str:
         if isinstance(self.client.session, StringSession):
             return self.client.session.save()
         return ""
