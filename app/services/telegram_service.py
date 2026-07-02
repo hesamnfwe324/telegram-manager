@@ -345,25 +345,25 @@ class TelegramUserService:
         """
         try:
             # --- Resolve destination group entity ---
-              # Always resolve to a proper entity (carries access_hash).
-              # Raw integer peer IDs cause "invalid peer" for supergroups not in cache.
-              dest_entity: Any = None
-              if group_link:
-                  try:
-                      dest_entity = await self.client.get_entity(group_link)
-                  except Exception as link_exc:
-                      logger.warning(
-                          "Cannot resolve group via link %s: %s — falling back to ID",
-                          group_link, link_exc,
-                      )
-              if dest_entity is None:
-                  try:
-                      dest_entity = await self.client.get_entity(group_id)
-                  except Exception as id_exc:
-                      logger.warning(
-                          "Cannot resolve entity for group_id %d: %s", group_id, id_exc
-                      )
-                      return False, f"entity_not_found: {id_exc}"
+            # Always resolve to a proper entity (carries access_hash).
+            # Raw integer peer IDs cause "invalid peer" for supergroups not in cache.
+            dest_entity: Any = None
+            if group_link:
+                try:
+                    dest_entity = await self.client.get_entity(group_link)
+                except Exception as link_exc:
+                    logger.warning(
+                        "Cannot resolve group via link %s: %s — falling back to ID",
+                        group_link, link_exc,
+                    )
+            if dest_entity is None:
+                try:
+                    dest_entity = await self.client.get_entity(group_id)
+                except Exception as id_exc:
+                    logger.warning(
+                        "Cannot resolve entity for group_id %d: %s", group_id, id_exc
+                    )
+                    return False, f"entity_not_found: {id_exc}"
 
             # ----------------------------------------------------------------
             # Path 1: TRUE FORWARD — use Telethon forward_messages so the
@@ -529,172 +529,172 @@ class TelegramUserService:
 
 
     async def send_dm_to_user(
-          self,
-          user_id: int,
-          message_text: str = "",
-          media_file_id: str | None = None,
-          media_type: str | None = None,
-          is_forward: bool = False,
-          forward_from_chat_id: int | None = None,
-          forward_from_message_id: int | None = None,
-          bot: Any = None,
-      ) -> tuple[bool, str | None]:
-          """Send a direct message to a user via the Telethon user client (personal account).
+        self,
+        user_id: int,
+        message_text: str = "",
+        media_file_id: str | None = None,
+        media_type: str | None = None,
+        is_forward: bool = False,
+        forward_from_chat_id: int | None = None,
+        forward_from_message_id: int | None = None,
+        bot: Any = None,
+    ) -> tuple[bool, str | None]:
+        """Send a direct message to a user via the Telethon user client (personal account).
 
-          Returns (ok, error_reason).
-          Possible error_reason values:
-            'blocked'         — user blocked the account
-            'deactivated'     — user account is deactivated
-            'peer_not_found'  — Telethon cannot resolve this user_id (no shared history)
-            'flood_wait:<N>s' — API flood wait; caller will sleep accordingly
-            'peer_flood'      — too many DMs, account temporarily restricted
-            or raw exception string for unexpected errors.
-          """
-          from telethon.errors.rpcerrorlist import (
-              PeerIdInvalidError,
-              UsernameInvalidError,
-              UsernameNotOccupiedError,
-          )
+        Returns (ok, error_reason).
+        Possible error_reason values:
+          'blocked'         — user blocked the account
+          'deactivated'     — user account is deactivated
+          'peer_not_found'  — Telethon cannot resolve this user_id (no shared history)
+          'flood_wait:<N>s' — API flood wait; caller will sleep accordingly
+          'peer_flood'      — too many DMs, account temporarily restricted
+          or raw exception string for unexpected errors.
+        """
+        from telethon.errors.rpcerrorlist import (
+            PeerIdInvalidError,
+            UsernameInvalidError,
+            UsernameNotOccupiedError,
+        )
 
-          try:
-              # Resolve the user entity — Telethon caches access_hash after any
-              # shared-group interaction, so this succeeds for contacts seen before.
-              try:
-                  entity = await self.client.get_input_entity(user_id)
-              except (PeerIdInvalidError, UsernameInvalidError,
-                      UsernameNotOccupiedError, ValueError, KeyError):
-                  return False, "peer_not_found"
+        try:
+            # Resolve the user entity — Telethon caches access_hash after any
+            # shared-group interaction, so this succeeds for contacts seen before.
+            try:
+                entity = await self.client.get_input_entity(user_id)
+            except (PeerIdInvalidError, UsernameInvalidError,
+                    UsernameNotOccupiedError, ValueError, KeyError):
+                return False, "peer_not_found"
 
-              # ── Path 1: FORWARD (preserves "Forwarded from …" header) ──────────
-              if is_forward and forward_from_chat_id and forward_from_message_id:
-                  try:
-                      await self.client.forward_messages(
-                          entity=entity,
-                          messages=[forward_from_message_id],
-                          from_peer=forward_from_chat_id,
-                      )
-                      return True, None
-                  except Exception as fwd_exc:
-                      logger.warning(
-                          "forward_messages to user %d failed: %s — trying fallback",
-                          user_id, fwd_exc,
-                      )
-                      if not media_file_id and not message_text:
-                          return False, f"forward_failed: {fwd_exc}"
+            # ── Path 1: FORWARD (preserves "Forwarded from …" header) ──────────
+            if is_forward and forward_from_chat_id and forward_from_message_id:
+                try:
+                    await self.client.forward_messages(
+                        entity=entity,
+                        messages=[forward_from_message_id],
+                        from_peer=forward_from_chat_id,
+                    )
+                    return True, None
+                except Exception as fwd_exc:
+                    logger.warning(
+                        "forward_messages to user %d failed: %s — trying fallback",
+                        user_id, fwd_exc,
+                    )
+                    if not media_file_id and not message_text:
+                        return False, f"forward_failed: {fwd_exc}"
 
-              # ── Path 2: MEDIA — download via Bot API, re-upload via Telethon ───
-              if media_file_id and media_type:
-                  bio = await self._download_bot_file(media_file_id, bot)
-                  if bio is not None:
-                      try:
-                          await self.client.send_file(
-                              entity,
-                              **_send_file_kwargs(bio, media_type, message_text),
-                          )
-                          return True, None
-                      except Exception as media_exc:
-                          logger.warning(
-                              "send_file to user %d failed: %s — trying text fallback",
-                              user_id, media_exc,
-                          )
-                          if not message_text:
-                              return False, str(media_exc)
-                  else:
-                      logger.warning("Could not download file_id for user %d — text fallback", user_id)
-                      if not message_text:
-                          return False, "media_download_failed"
+            # ── Path 2: MEDIA — download via Bot API, re-upload via Telethon ───
+            if media_file_id and media_type:
+                bio = await self._download_bot_file(media_file_id, bot)
+                if bio is not None:
+                    try:
+                        await self.client.send_file(
+                            entity,
+                            **_send_file_kwargs(bio, media_type, message_text),
+                        )
+                        return True, None
+                    except Exception as media_exc:
+                        logger.warning(
+                            "send_file to user %d failed: %s — trying text fallback",
+                            user_id, media_exc,
+                        )
+                        if not message_text:
+                            return False, str(media_exc)
+                else:
+                    logger.warning("Could not download file_id for user %d — text fallback", user_id)
+                    if not message_text:
+                        return False, "media_download_failed"
 
-              # ── Path 3: PLAIN TEXT ─────────────────────────────────────────────
-              if message_text:
-                  await self.client.send_message(entity, message_text)
-                  return True, None
+            # ── Path 3: PLAIN TEXT ─────────────────────────────────────────────
+            if message_text:
+                await self.client.send_message(entity, message_text)
+                return True, None
 
-              return False, "no_sendable_content"
+            return False, "no_sendable_content"
 
-          except UserIsBlockedError:
-              return False, "blocked"
-          except InputUserDeactivatedError:
-              return False, "deactivated"
-          except PeerFloodError:
-              return False, "peer_flood"
-          except FloodWaitError as exc:
-              logger.warning("FloodWait sending DM to user %d: wait %ds", user_id, exc.seconds)
-              return False, f"flood_wait:{exc.seconds}s"
-          except Exception as exc:
-              logger.error("Failed to send DM to user %d: %s", user_id, exc, exc_info=True)
-              return False, str(exc)[:120]
+        except UserIsBlockedError:
+            return False, "blocked"
+        except InputUserDeactivatedError:
+            return False, "deactivated"
+        except PeerFloodError:
+            return False, "peer_flood"
+        except FloodWaitError as exc:
+            logger.warning("FloodWait sending DM to user %d: wait %ds", user_id, exc.seconds)
+            return False, f"flood_wait:{exc.seconds}s"
+        except Exception as exc:
+            logger.error("Failed to send DM to user %d: %s", user_id, exc, exc_info=True)
+            return False, str(exc)[:120]
 
-          async def get_all_groups_from_dialogs(self, limit: int = 3000) -> list[dict]:
-          """Return all groups/supergroups the account is in, from live Telethon dialogs.
+    async def get_all_groups_from_dialogs(self, limit: int = 3000) -> list[dict]:
+        """Return all groups/supergroups the account is in, from live Telethon dialogs.
 
-          Ground truth for broadcast — every group the account is currently a member of,
-          not just those stored in the DB. Entities carry access_hash so no
-          'invalid peer' errors occur during sending.
-          """
-          try:
-              dialogs = await asyncio.wait_for(
-                  self.client.get_dialogs(limit=limit),
-                  timeout=60.0,
-              )
-          except asyncio.TimeoutError:
-              logger.warning("get_all_groups_from_dialogs timed out after 60s")
-              dialogs = []
-          except Exception as exc:
-              logger.warning("get_all_groups_from_dialogs failed: %s", exc)
-              dialogs = []
+        Ground truth for broadcast — every group the account is currently a member of,
+        not just those stored in the DB. Entities carry access_hash so no
+        'invalid peer' errors occur during sending.
+        """
+        try:
+            dialogs = await asyncio.wait_for(
+                self.client.get_dialogs(limit=limit),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("get_all_groups_from_dialogs timed out after 60s")
+            dialogs = []
+        except Exception as exc:
+            logger.warning("get_all_groups_from_dialogs failed: %s", exc)
+            dialogs = []
 
-          groups: list[dict] = []
-          for d in dialogs:
-              entity = d.entity
-              if isinstance(entity, Chat):
-                  groups.append({
-                      "group_id": d.id,
-                      "title": entity.title,
-                      "username": None,
-                      "members_count": getattr(entity, "participants_count", None),
-                  })
-              elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
-                  groups.append({
-                      "group_id": d.id,
-                      "title": entity.title,
-                      "username": getattr(entity, "username", None),
-                      "members_count": getattr(entity, "participants_count", None),
-                  })
-          logger.info("get_all_groups_from_dialogs: %d groups found", len(groups))
-          return groups
+        groups: list[dict] = []
+        for d in dialogs:
+            entity = d.entity
+            if isinstance(entity, Chat):
+                groups.append({
+                    "group_id": d.id,
+                    "title": entity.title,
+                    "username": None,
+                    "members_count": getattr(entity, "participants_count", None),
+                })
+            elif isinstance(entity, Channel) and not getattr(entity, "broadcast", False):
+                groups.append({
+                    "group_id": d.id,
+                    "title": entity.title,
+                    "username": getattr(entity, "username", None),
+                    "members_count": getattr(entity, "participants_count", None),
+                })
+        logger.info("get_all_groups_from_dialogs: %d groups found", len(groups))
+        return groups
 
-      async def sync_dialogs_to_db(self) -> tuple[int, int]:
-          """Sync all live Telethon group dialogs into the DB as JOINED groups.
+    async def sync_dialogs_to_db(self) -> tuple[int, int]:
+        """Sync all live Telethon group dialogs into the DB as JOINED groups.
 
-          Returns (new_count, total_count).
-          """
-          from datetime import datetime, timezone
-          from app.database.connection import AsyncSessionLocal
-          from app.repositories import GroupRepository
-          from app.models.group import GroupStatus
+        Returns (new_count, total_count).
+        """
+        from datetime import datetime, timezone
+        from app.database.connection import AsyncSessionLocal
+        from app.repositories import GroupRepository
+        from app.models.group import GroupStatus
 
-          all_groups = await self.get_all_groups_from_dialogs()
-          new_count = 0
+        all_groups = await self.get_all_groups_from_dialogs()
+        new_count = 0
 
-          async with AsyncSessionLocal() as session:
-              repo = GroupRepository(session)
-              for g in all_groups:
-                  _, created = await repo.upsert(
-                      group_id=g["group_id"],
-                      title=g["title"],
-                      username=g.get("username"),
-                      members_count=g.get("members_count"),
-                      status=GroupStatus.JOINED,
-                      join_date=datetime.now(timezone.utc),
-                  )
-                  if created:
-                      new_count += 1
-              await session.commit()
+        async with AsyncSessionLocal() as session:
+            repo = GroupRepository(session)
+            for g in all_groups:
+                _, created = await repo.upsert(
+                    group_id=g["group_id"],
+                    title=g["title"],
+                    username=g.get("username"),
+                    members_count=g.get("members_count"),
+                    status=GroupStatus.JOINED,
+                    join_date=datetime.now(timezone.utc),
+                )
+                if created:
+                    new_count += 1
+            await session.commit()
 
-          logger.info("sync_dialogs_to_db: %d total, %d new", len(all_groups), new_count)
-          return new_count, len(all_groups)
+        logger.info("sync_dialogs_to_db: %d total, %d new", len(all_groups), new_count)
+        return new_count, len(all_groups)
 
-          async def get_all_user_dialogs(self, limit: int = 3000) -> list[dict]:
+    async def get_all_user_dialogs(self, limit: int = 3000) -> list[dict]:
         """Return all private (one-on-one) chat users from the personal Telethon account.
 
         Ground truth for user broadcast — the account's actual PV contacts,
