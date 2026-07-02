@@ -694,7 +694,69 @@ class TelegramUserService:
           logger.info("sync_dialogs_to_db: %d total, %d new", len(all_groups), new_count)
           return new_count, len(all_groups)
 
-          async def get_session_string(self) -> str:
+          async def get_all_user_dialogs(self, limit: int = 3000) -> list[dict]:
+        """Return all private (one-on-one) chat users from the personal Telethon account.
+
+        Ground truth for user broadcast — the account's actual PV contacts,
+        NOT the bot's contacted_users DB. Entities carry access_hash.
+        """
+        from telethon.tl.types import User as TLUser
+        try:
+            dialogs = await asyncio.wait_for(
+                self.client.get_dialogs(limit=limit),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("get_all_user_dialogs timed out after 60s")
+            dialogs = []
+        except Exception as exc:
+            logger.warning("get_all_user_dialogs failed: %s", exc)
+            dialogs = []
+
+        users: list[dict] = []
+        for d in dialogs:
+            entity = d.entity
+            if (isinstance(entity, TLUser)
+                    and not getattr(entity, "bot", False)
+                    and not getattr(entity, "deleted", False)):
+                users.append({
+                    "user_id": entity.id,
+                    "username": getattr(entity, "username", None),
+                    "first_name": getattr(entity, "first_name", None),
+                    "last_name": getattr(entity, "last_name", None),
+                })
+        logger.info("get_all_user_dialogs: %d private-chat users found", len(users))
+        return users
+
+    async def sync_user_dialogs_to_db(self) -> tuple[int, int]:
+        """Sync all private-chat Telethon contacts into the contacted_users DB.
+
+        Returns (new_count, total_count).
+        """
+        from datetime import datetime, timezone
+        from app.database.connection import AsyncSessionLocal
+        from app.repositories import ContactedUserRepository
+
+        all_users = await self.get_all_user_dialogs()
+        new_count = 0
+
+        async with AsyncSessionLocal() as session:
+            repo = ContactedUserRepository(session)
+            for u in all_users:
+                _, created = await repo.register_or_update(
+                    user_id=u["user_id"],
+                    username=u.get("username"),
+                    first_name=u.get("first_name"),
+                    last_name=u.get("last_name"),
+                )
+                if created:
+                    new_count += 1
+            await session.commit()
+
+        logger.info("sync_user_dialogs_to_db: %d total, %d new", len(all_users), new_count)
+        return new_count, len(all_users)
+
+        async def get_session_string(self) -> str:
         if isinstance(self.client.session, StringSession):
             return self.client.session.save()
         return ""
