@@ -36,6 +36,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="▶️ شروع سیستم", callback_data="system_start"),
             InlineKeyboardButton(text="⏹ توقف سیستم", callback_data="system_stop"),
         ],
+        [
+            InlineKeyboardButton(text="📋 وضعیت صف عضویت", callback_data="queue_status"),
+        ],
         [InlineKeyboardButton(text="🔄 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
             InlineKeyboardButton(text="👥 همگام‌سازی مخاطبین", callback_data="sync_users")],
     ])
@@ -140,6 +143,51 @@ async def cmd_queue_status(message: Message) -> None:
         f"⏱ زمان تخمینی تمام شدن صف: <b>{eta_str}</b>\n"
         f"⚙️ تأخیر بین هر عضویت: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
+    )
+
+
+
+
+@router.callback_query(F.data == "queue_status")
+async def cb_queue_status(callback: CallbackQuery) -> None:
+    """وضعیت صف عضویت گروه‌ها — نمایش inline."""
+    await callback.answer()
+    from app.services.join_queue_service import JoinQueueService
+    from app.database.connection import AsyncSessionLocal
+    from app.repositories.join_attempt_repository import JoinAttemptRepository
+
+    jq = JoinQueueService.get_instance()
+    queue_size = jq.queue_size()
+
+    async with AsyncSessionLocal() as session:
+        attempt_repo = JoinAttemptRepository(session)
+        today_count = await attempt_repo.count_today()
+
+    delay_min = 7
+    eta_minutes = queue_size * delay_min
+    if eta_minutes == 0:
+        eta_str = "صف خالی است ✅"
+    elif eta_minutes >= 60:
+        eta_str = f"{eta_minutes // 60} ساعت و {eta_minutes % 60} دقیقه"
+    else:
+        eta_str = f"{eta_minutes} دقیقه"
+
+    status_icon = "⏳" if queue_size > 0 else "✅"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="queue_status")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
+    ])
+
+    await _safe_edit(
+        callback,
+        f"📋 <b>وضعیت صف عضویت</b>\n\n"
+        f"{status_icon} در صف: <code>{queue_size}</code> گروه\n"
+        f"✅ عضو شده امروز: <code>{today_count}</code> گروه\n"
+        f"⏱ زمان تخمینی: <b>{eta_str}</b>\n"
+        f"⚙️ فاصله بین هر عضویت: <code>{delay_min} دقیقه</code>",
+        parse_mode="HTML",
+        reply_markup=back_kb,
     )
 
 
