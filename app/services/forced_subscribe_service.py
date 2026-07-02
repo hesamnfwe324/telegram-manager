@@ -157,11 +157,15 @@ class ForcedSubscribeService:
                 if not text:
                     return
 
+                # Only trust messages from bots or service messages (no sender)
                 sender = await event.get_sender()
-                is_bot = getattr(sender, "bot", False) if sender else False
+                is_bot = getattr(sender, "bot", False) if sender else True  # no sender = service
+                if not is_bot:
+                    return  # ignore regular user messages to avoid false positives
+
                 logger.debug(
-                    "ForcedSubscribe[check_after_join]: msg in group=%d bot=%s text=%r",
-                    group_id, is_bot, text[:100],
+                    "ForcedSubscribe[check_after_join]: bot msg in group=%d text=%r",
+                    group_id, text[:100],
                 )
 
                 if _looks_like_forced_subscribe(text):
@@ -220,7 +224,21 @@ class ForcedSubscribeService:
                     or getattr(message, "message", None)
                     or ""
                 )
-                if text and _looks_like_forced_subscribe(text):
+                if not text:
+                    continue
+
+                # Only trust service messages (no sender) or bot messages
+                sender_id = getattr(message, "sender_id", None)
+                if sender_id is not None:
+                    try:
+                        sender = await self._tg.client.get_entity(sender_id)
+                        is_bot = getattr(sender, "bot", False)
+                        if not is_bot:
+                            continue  # skip regular user messages
+                    except Exception:
+                        continue  # can't resolve sender → skip to be safe
+
+                if _looks_like_forced_subscribe(text):
                     targets = _extract_targets(text)
                     if targets:
                         logger.info(
@@ -229,6 +247,7 @@ class ForcedSubscribeService:
                             group_id, group_title, targets,
                         )
                         detected_targets.extend(targets)
+                        break  # stop at first high-confidence match
 
             if detected_targets:
                 # Deduplicate before joining
@@ -263,6 +282,13 @@ class ForcedSubscribeService:
 
         for target in targets:
             try:
+                # Validate target is a channel/group before joining
+                if not await self._is_joinable_entity(target):
+                    logger.warning(
+                        "ForcedSubscribe: skipping %r — not a channel/group", target
+                    )
+                    continue
+
                 success, _, error = await self._tg.join_group(target)
                 if success:
                     logger.info(
@@ -293,6 +319,18 @@ class ForcedSubscribeService:
                 )
 
         return joined
+
+    async def _is_joinable_entity(self, target: str) -> bool:
+        """Return True only if *target* resolves to a channel or group (not a user)."""
+        if self._tg is None:
+            return False
+        try:
+            from telethon.tl.types import Channel, Chat, ChatForbidden, ChannelForbidden
+            entity = await self._tg.client.get_entity(target)
+            return isinstance(entity, (Channel, Chat, ChatForbidden, ChannelForbidden))
+        except Exception as exc:
+            logger.debug("ForcedSubscribe._is_joinable_entity(%r): %s", target, exc)
+            return False
 
     async def _notify(
         self,
