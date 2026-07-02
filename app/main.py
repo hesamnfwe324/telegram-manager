@@ -4,7 +4,9 @@ import signal
 import sys
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
 from aiogram.enums import ParseMode
+from aiogram.types import ErrorEvent
 from aiogram.client.default import DefaultBotProperties
 from sqlalchemy import text
 
@@ -243,20 +245,68 @@ async def main() -> None:
     asyncio.create_task(_start_client_safe())
     scheduler.start()
 
-    # Delete any stale webhook so polling does not conflict with a previous
-    # Render deployment that set a webhook or left a getUpdates session open.
-    # This must run BEFORE start_polling or Telegram returns ConflictError.
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("Webhook cleared — ready for polling")
-    except Exception as _wh_exc:
-        logger.warning("Could not clear webhook (non-fatal): %s", _wh_exc)
+    # ── Layer 1: register conflict error handler with long backoff ─────────────
+    # TelegramConflictError fires when two instances poll simultaneously
+    # (Render zero-downtime deploy overlap). aiogram retries after 1 s by
+    # default; our handler sleeps 15 s to let the old instance vacate first.
+    _conflict_backoff: list[float] = [1.0]  # mutable cell for closure
 
-    logger.info("Bot polling started")
+    @dp.error()
+    async def _handle_conflict(event: ErrorEvent) -> bool:
+        exc = event.exception
+        if isinstance(exc, TelegramConflictError):
+            backoff = min(_conflict_backoff[0] * 2, 60.0)
+            _conflict_backoff[0] = backoff
+            logger.info(
+                "TelegramConflictError: previous instance is still shutting down — "
+                "waiting %.0fs before retry (Render deploy overlap, resolves automatically)",
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            return True  # mark handled; suppress aiogram's default 1-s retry log
+        if isinstance(exc, TelegramNetworkError):
+            logger.warning("TelegramNetworkError: %s — aiogram will retry", exc)
+            return True
+        return False
+
+    # ── Layer 2: delete stale webhook + clear previous long-poll session ────────
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted (drop_pending_updates=True)")
+    except Exception as _wh_exc:
+        logger.warning("Could not delete webhook (non-fatal): %s", _wh_exc)
+
+    # Force-close any leftover getUpdates session by consuming offset=-1 quickly.
+    # This makes Telegram invalidate the previous long-poll connection immediately
+    # instead of waiting for its 30-second timeout to expire.
+    try:
+        await asyncio.wait_for(bot.get_updates(offset=-1, timeout=0, limit=1), timeout=5.0)
+        logger.info("Previous Telegram session cleared via offset=-1 probe")
+    except asyncio.TimeoutError:
+        logger.info("getUpdates probe timed out (expected) — session cleared")
+    except TelegramConflictError:
+        logger.info("TelegramConflictError on probe — old instance still active, startup fence will handle it")
+    except Exception as _probe_exc:
+        logger.info("Session probe: %s (non-fatal)", _probe_exc)
+
+    # ── Layer 3: startup fence ─────────────────────────────────────────────────
+    # Render web-service zero-downtime deploy: new container starts → passes
+    # health check → THEN Render sends SIGTERM to the old container. The old
+    # container needs a few seconds to finish its in-flight getUpdates call and
+    # exit cleanly. We wait here so we don't race with it.
+    _STARTUP_FENCE_SECS = 10
+    logger.info(
+        "Startup fence: waiting %ds for previous instance to release its "
+        "Telegram polling session before we start…", _STARTUP_FENCE_SECS
+    )
+    await asyncio.sleep(_STARTUP_FENCE_SECS)
+    logger.info("Startup fence complete — starting bot polling")
+
     polling_task = asyncio.create_task(
         dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
+            handle_signals=False,   # we manage SIGTERM ourselves via _shutdown_event
         )
     )
     shutdown_task = asyncio.create_task(_shutdown_event.wait())
@@ -266,7 +316,17 @@ async def main() -> None:
         return_when=asyncio.FIRST_COMPLETED,
     )
 
-    logger.info("Shutdown initiated — cleaning up")
+    logger.info("Shutdown initiated — stopping polling first")
+
+    # Explicitly stop aiogram polling so Telegram knows this session is ending.
+    # This allows the NEXT instance that starts up to claim getUpdates without
+    # hitting a ConflictError. Give it 5 s max before we force-cancel.
+    try:
+        await asyncio.wait_for(dp.stop_polling(), timeout=5.0)
+        logger.info("Bot polling stopped cleanly")
+    except Exception as _stop_exc:
+        logger.warning("dp.stop_polling() error (continuing shutdown): %s", _stop_exc)
+
     for task in pending:
         task.cancel()
         try:
