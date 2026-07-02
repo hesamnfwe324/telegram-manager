@@ -39,6 +39,17 @@ class JoinAttemptRepository(BaseRepository[JoinAttempt]):
         )
         return result.scalar_one()
 
+    async def count_today_successful(self) -> int:
+        """Count successful join attempts today (success=True only)."""
+        since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(JoinAttempt)
+            .where(JoinAttempt.attempted_at >= since)
+            .where(JoinAttempt.success == True)  # noqa: E712
+        )
+        return result.scalar_one()
+
     async def count_for_group(self, group_id: int) -> int:
         result = await self._session.execute(
             select(func.count())
