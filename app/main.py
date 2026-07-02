@@ -229,6 +229,7 @@ async def main() -> None:
             await tg.start()
             discovery = DiscoveryService(tg)
             tg.on_new_message(discovery.process_message)
+            tg.on_new_message(forced_subscribe.process_message)
             await approval_watcher.start()   # watch for approved join requests
             await jq.start()
             await health.start()

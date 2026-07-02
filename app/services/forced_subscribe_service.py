@@ -120,6 +120,8 @@ class ForcedSubscribeService:
 
     def __init__(self) -> None:
         self._tg: TelegramUserService | None = None
+        # Tracks groups currently being processed to avoid duplicate auto-joins
+        self._handling: set[int] = set()
 
     @classmethod
     def get_instance(cls) -> ForcedSubscribeService:
@@ -129,6 +131,60 @@ class ForcedSubscribeService:
 
     def set_tg_service(self, tg: TelegramUserService) -> None:
         self._tg = tg
+
+    # ── Permanent global listener ─────────────────────────────────────────────
+
+    async def process_message(self, event: Any) -> None:
+        """
+        Permanent handler registered at startup (like DiscoveryService).
+        Monitors ALL incoming bot messages across all groups and auto-resolves
+        forced-subscribe restrictions as soon as they appear — regardless of
+        whether we just joined or are in the middle of a broadcast.
+        """
+        try:
+            text: str = getattr(event.message, "text", "") or getattr(event.message, "message", "") or ""
+            if not text:
+                return
+
+            # Only react to messages from bots or service messages (no sender)
+            sender = await event.get_sender()
+            if sender is not None:
+                is_bot = getattr(sender, "bot", False)
+                if not is_bot:
+                    return  # ignore regular user messages
+
+            if not _looks_like_forced_subscribe(text):
+                return
+
+            targets = _extract_targets(text)
+            if not targets:
+                return
+
+            group_id: int = event.chat_id
+            if group_id in self._handling:
+                return  # already processing this group
+
+            logger.info(
+                "ForcedSubscribe[global]: restriction detected in group %d — targets: %s",
+                group_id, targets,
+            )
+
+            self._handling.add(group_id)
+            try:
+                # Get group title for notification
+                group_title: str | None = None
+                try:
+                    chat = await event.get_chat()
+                    group_title = getattr(chat, "title", None)
+                except Exception:
+                    pass
+
+                await self._join_targets(targets, group_id, group_title)
+            finally:
+                self._handling.discard(group_id)
+
+        except Exception as exc:
+            logger.error("ForcedSubscribe.process_message error: %s", exc, exc_info=True)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
