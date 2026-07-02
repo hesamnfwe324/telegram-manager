@@ -21,6 +21,7 @@ from app.services import (
     HealthService,
     SchedulerService,
     JoinApprovalWatcher,
+    ForcedSubscribeService,
 )
 
 logger = get_logger(__name__)
@@ -216,6 +217,9 @@ async def main() -> None:
 
     approval_watcher = JoinApprovalWatcher.get_instance()
     approval_watcher.set_tg_service(tg)
+
+    forced_subscribe = ForcedSubscribeService.get_instance()
+    forced_subscribe.set_tg_service(tg)
 
     scheduler = SchedulerService.get_instance()
     scheduler.set_bot(bot)

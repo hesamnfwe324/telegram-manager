@@ -428,6 +428,11 @@ class TelegramUserService:
             return False, "no_sendable_content"
 
         except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
+            # Try to resolve forced-subscribe restrictions automatically
+            asyncio.create_task(
+                self._handle_forced_subscribe(group_id),
+                name=f"forced-subscribe-write-forbidden-{group_id}",
+            )
             return False, f"no_write_permission: {exc}"
         except FloodWaitError as exc:
             logger.warning(
@@ -438,6 +443,23 @@ class TelegramUserService:
         except Exception as exc:
             logger.error("Failed to send to group %d: %s", group_id, exc, exc_info=True)
             return False, str(exc)
+
+    async def _handle_forced_subscribe(self, group_id: int) -> None:
+        """Triggered after ChatWriteForbiddenError — detects and resolves forced-subscribe."""
+        try:
+            from app.services.forced_subscribe_service import ForcedSubscribeService
+            fs = ForcedSubscribeService.get_instance()
+            auto_joined = await fs.handle_write_forbidden(group_id)
+            if auto_joined:
+                logger.info(
+                    "ForcedSubscribe[write-forbidden]: auto-joined %d target(s) for group %d: %s",
+                    len(auto_joined), group_id, auto_joined,
+                )
+        except Exception as exc:
+            logger.error(
+                "ForcedSubscribe._handle_forced_subscribe error for group %d: %s",
+                group_id, exc,
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
