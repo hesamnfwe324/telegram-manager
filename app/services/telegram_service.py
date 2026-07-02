@@ -756,7 +756,7 @@ class TelegramUserService:
         logger.info("sync_user_dialogs_to_db: %d total, %d new", len(all_users), new_count)
         return new_count, len(all_users)
 
-        async def get_session_string(self) -> str:
+    async def get_session_string(self) -> str:
         if isinstance(self.client.session, StringSession):
             return self.client.session.save()
         return ""
