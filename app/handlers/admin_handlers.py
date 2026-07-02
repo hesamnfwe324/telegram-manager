@@ -150,21 +150,13 @@ async def cmd_queue_status(message: Message) -> None:
 
 @router.callback_query(F.data == "queue_status")
 async def cb_queue_status(callback: CallbackQuery) -> None:
-    """وضعیت صف عضویت گروه‌ها — نمایش inline."""
+    """وضعیت صف عضویت — همه اعداد از StatsService (منبع واحد)."""
     await callback.answer()
-    from app.services.join_queue_service import JoinQueueService
-    from app.database.connection import AsyncSessionLocal
-    from app.repositories.join_attempt_repository import JoinAttemptRepository
-
-    jq = JoinQueueService.get_instance()
-    queue_size = jq.queue_size()
-
-    async with AsyncSessionLocal() as session:
-        attempt_repo = JoinAttemptRepository(session)
-        today_count = await attempt_repo.count_today()
+    from app.services.stats_service import StatsService
+    s = await StatsService().get_stats()
 
     delay_min = 7
-    eta_minutes = queue_size * delay_min
+    eta_minutes = s.pending_queue_size * delay_min
     if eta_minutes == 0:
         eta_str = "صف خالی است ✅"
     elif eta_minutes >= 60:
@@ -172,7 +164,7 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     else:
         eta_str = f"{eta_minutes} دقیقه"
 
-    status_icon = "⏳" if queue_size > 0 else "✅"
+    status_icon = "⏳" if s.pending_queue_size > 0 else "✅"
 
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="queue_status")],
@@ -182,8 +174,9 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     await _safe_edit(
         callback,
         f"📋 <b>وضعیت صف عضویت</b>\n\n"
-        f"{status_icon} در صف: <code>{queue_size}</code> گروه\n"
-        f"✅ عضو شده امروز: <code>{today_count}</code> گروه\n"
+        f"{status_icon} در صف: <code>{s.pending_queue_size}</code> گروه\n"
+        f"✅ عضو شده امروز: <code>{s.today_joins}</code> گروه\n"
+        f"🟢 کل عضویت‌های موفق: <code>{s.joined_groups}</code> گروه\n"
         f"⏱ زمان تخمینی: <b>{eta_str}</b>\n"
         f"⚙️ فاصله بین هر عضویت: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
@@ -196,11 +189,13 @@ async def cb_system_health(callback: CallbackQuery) -> None:
     await callback.answer()
     from app.services import TelegramUserService, HealthService, JoinQueueService
     from app.services.broadcast_queue_service import BroadcastQueueService
+    from app.services.stats_service import StatsService
 
     tg = TelegramUserService.get_instance()
     health = HealthService.get_instance()
     jq = JoinQueueService.get_instance()
     bqs = BroadcastQueueService.get_instance()
+    s = await StatsService().get_stats()
 
     client_status = "🟢 متصل" if tg.is_running() else "🔴 قطع"
     health_status = "✅ سالم" if health.is_healthy() else "⚠️ مشکل دارد"
@@ -231,7 +226,7 @@ async def cb_system_health(callback: CallbackQuery) -> None:
         f"📡 User Client: {client_status}\n"
         f"🏥 Health Monitor: {health_status}\n"
         f"⏱ آخرین بررسی OK: <code>{last_ok_str}</code>\n"
-        f"📋 صف عضویت: <code>{jq.queue_size()}</code> مورد در انتظار\n"
+        f"📋 صف عضویت: <code>{s.pending_queue_size}</code> در انتظار | ✅ امروز: <code>{s.today_joins}</code>\n"
         f"📢 Broadcast: {bc_status}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
