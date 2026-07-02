@@ -5,10 +5,11 @@ Progress and results are reported to the requesting admin.
 
 ARCHITECTURE NOTE
 -----------------
-User DMs  → Bot API (aiogram)   : users interacted with the BOT, which knows them.
-                                   Telethon user-client has no access_hash for them.
+User DMs  → Telethon user client : personal account sends DMs to contacts directly.
+                                    Requires shared-group history for entity resolution.
 Group msgs → Telethon user client: the Telethon account joined those groups.
                                    The bot may not be a member of every group.
+Bot API (aiogram) is used ONLY for admin notifications and progress messages.
 """
 import asyncio
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 DM_DELAY = 0.5        # seconds between DMs — 0.5s is safe under Bot API 30/s global limit
+TG_DM_DELAY = 3.0    # seconds between Telethon user-account DMs (avoids FloodWait)
 GROUP_DELAY = 2       # seconds between group sends
 MAX_STORED_JOBS = 50
 PER_CALL_TIMEOUT = 60 # max seconds for a single Telethon call (prevents FloodWait hang)
@@ -169,11 +171,11 @@ class BroadcastQueueService:
             await self._report(job)
 
     # ══════════════════════════════════════════════════════════════════
-    # USER BROADCAST — uses Bot API (aiogram)
+    # USER BROADCAST — uses Telethon user client (personal account)
     # ══════════════════════════════════════════════════════════════════
-    # CRITICAL: users are in contacted_users because they messaged the BOT.
-    # The Bot API knows them; the Telethon user-client does NOT (no access_hash).
-    # Using Telethon here causes PeerIdInvalidError for every user → 0 success.
+    # Messages are sent from the personal Telethon account, not the bot.
+    # Telethon resolves users via shared-group entity cache.
+    # Users with no shared history → 'peer_not_found' (counted as deactivated).
     # ══════════════════════════════════════════════════════════════════
 
     async def _bot_send_to_user(self, job: BroadcastJob, user_id: int) -> tuple[bool, str | None]:
@@ -262,58 +264,89 @@ class BroadcastQueueService:
             await bot.send_document(**kw, document=file_id)
 
     async def _send_to_users(self, job: BroadcastJob) -> None:
-          async with AsyncSessionLocal() as session:
-              repo = ContactedUserRepository(session)
-              users = await repo.get_active(limit=10000)
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
 
-          job.total = len(users)
-          actor = str(job.actor_id)
-          logger.info("Broadcast job %s: sending to %d users via Bot API", job.job_id, job.total)
+        async with AsyncSessionLocal() as session:
+            repo = ContactedUserRepository(session)
+            users = await repo.get_active(limit=10000)
 
-          if not users:
-              logger.info("Broadcast job %s: no active users to send to", job.job_id)
-              return
+        job.total = len(users)
+        actor = str(job.actor_id)
+        logger.info("Broadcast job %s: sending to %d users via Telethon (personal account)", job.job_id, job.total)
 
-          # Send ONE initial progress message — all updates EDIT this single message
-          try:
-              prog_msg = await job.bot.send_message(
-                  job.actor_id,
-                  f"⏳ <b>ارسال همگانی شروع شد</b>\n\n"
-                  f"📦 کاربران فعال: <code>{job.total}</code>\n"
-                  f"در حال ارسال...",
-                  parse_mode="HTML",
-              )
-              job.progress_message_id = prog_msg.message_id
-          except Exception as exc:
-              logger.warning("Could not send initial progress message: %s", exc)
+        if not users:
+            logger.info("Broadcast job %s: no active users to send to", job.job_id)
+            return
 
-          for idx, user in enumerate(users):
-              ok, reason = await self._bot_send_to_user(job, user.user_id)
+        # Warm up Telethon entity cache so access_hash lookups succeed
+        await tg.refresh_dialogs(limit=1000, timeout=30.0)
 
-              if ok:
-                  job.success += 1
-                  await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
-              else:
-                  job.failed += 1
-                  if job.first_user_error is None:
-                      job.first_user_error = f"uid={user.user_id}: {reason}"
-                  if reason == "blocked":
-                      job.blocked += 1
-                      await self._mark_user_blocked(user.user_id)
-                  elif reason in ("deactivated", "migrated"):
-                      job.deactivated += 1
-                      await self._mark_user_blocked(user.user_id)
-                  await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+        # Send ONE initial progress message — all updates EDIT this single message
+        try:
+            prog_msg = await job.bot.send_message(
+                job.actor_id,
+                f"⏳ <b>ارسال همگانی شروع شد</b>\n\n"
+                f"📦 کاربران فعال: <code>{job.total}</code>\n"
+                f"در حال ارسال از اکانت شخصی...",
+                parse_mode="HTML",
+            )
+            job.progress_message_id = prog_msg.message_id
+        except Exception as exc:
+            logger.warning("Could not send initial progress message: %s", exc)
 
-              done_count = idx + 1
-              if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
-                  await self._send_progress(job, done_count)
+        for idx, user in enumerate(users):
+            ok, reason = await tg.send_dm_to_user(
+                user_id=user.user_id,
+                message_text=job.message_text,
+                media_file_id=job.media_file_id,
+                media_type=job.media_type,
+                is_forward=job.is_forward,
+                forward_from_chat_id=job.forward_from_chat_id,
+                forward_from_message_id=job.forward_from_message_id,
+                bot=job.bot,
+            )
 
-              # Fast-fail cases (blocked/deactivated) need minimal delay
-              if reason in ("blocked", "deactivated", "migrated"):
-                  await asyncio.sleep(0.05)
-              else:
-                  await asyncio.sleep(DM_DELAY)
+            if ok:
+                job.success += 1
+                await self._log("broadcast_user_sent", "success", actor, str(user.user_id))
+            else:
+                job.failed += 1
+                if job.first_user_error is None:
+                    job.first_user_error = f"uid={user.user_id}: {reason}"
+
+                if reason == "blocked":
+                    job.blocked += 1
+                    await self._mark_user_blocked(user.user_id)
+                elif reason in ("deactivated", "peer_not_found"):
+                    job.deactivated += 1
+                    await self._mark_user_blocked(user.user_id)
+                elif reason == "peer_flood":
+                    # Account temporarily restricted — abort broadcast immediately
+                    job.error = "peer_flood: اکانت موقتاً محدود شد. broadcast متوقف شد."
+                    logger.error("Broadcast job %s stopped due to PeerFloodError", job.job_id)
+                    await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+                    return
+                elif reason and reason.startswith("flood_wait:"):
+                    try:
+                        wait_sec = int(reason.split(":")[1].rstrip("s"))
+                        wait_sec = min(wait_sec, 300)  # cap at 5 minutes
+                        logger.warning("Broadcast job %s: flood_wait %ds — sleeping", job.job_id, wait_sec)
+                        await asyncio.sleep(wait_sec)
+                    except Exception:
+                        await asyncio.sleep(30)
+
+                await self._log("broadcast_user_failed", "error", actor, str(user.user_id), reason)
+
+            done_count = idx + 1
+            if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
+                await self._send_progress(job, done_count)
+
+            # Telethon user-account DMs need a longer inter-message delay to avoid FloodWait
+            if reason in ("blocked", "deactivated", "peer_not_found"):
+                await asyncio.sleep(0.1)   # fast-skip unreachable users
+            else:
+                await asyncio.sleep(TG_DM_DELAY)
     # ══════════════════════════════════════════════════════════════════
     # GROUP BROADCAST — uses Telethon (user-client is a member)
     # ══════════════════════════════════════════════════════════════════
