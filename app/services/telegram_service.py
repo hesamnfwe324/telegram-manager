@@ -72,6 +72,21 @@ def _send_file_kwargs(bio: BytesIO, media_type: str, caption: str = "") -> dict[
     return kwargs
 
 
+
+def _record_sent_to_group(group_id: int, message_or_list: Any) -> None:
+    """Record sent message IDs for forced-subscribe reply-to-us detection."""
+    try:
+        from app.services.forced_subscribe_service import ForcedSubscribeService
+        fs = ForcedSubscribeService.get_instance()
+        msgs = message_or_list if isinstance(message_or_list, (list, tuple)) else [message_or_list]
+        for m in msgs:
+            mid = getattr(m, 'id', None)
+            if mid:
+                fs.record_our_message(group_id, mid)
+    except Exception:
+        pass
+
+
 class TelegramUserService:
     _instance: "TelegramUserService | None" = None
 
@@ -381,11 +396,12 @@ class TelegramUserService:
             # ----------------------------------------------------------------
             if is_forward and forward_from_chat_id and forward_from_message_id:
                 try:
-                    await self.client.forward_messages(
+                    _fwd = await self.client.forward_messages(
                         dest_entity,
                         messages=forward_from_message_id,
                         from_peer=forward_from_chat_id,
                     )
+                    _record_sent_to_group(group_id, _fwd)
                     return True, None
                 except (ChannelPrivateError, Exception) as fwd_exc:
                     # Source may not be accessible from the user account.
@@ -407,10 +423,11 @@ class TelegramUserService:
                 bio = await self._download_bot_file(media_file_id, bot)
                 if bio is not None:
                     try:
-                        await self.client.send_file(
+                        _sent = await self.client.send_file(
                             dest_entity,
                             **_send_file_kwargs(bio, media_type, message_text),
                         )
+                        _record_sent_to_group(group_id, _sent)
                         return True, None
                     except Exception as media_exc:
                         logger.warning(
@@ -432,7 +449,8 @@ class TelegramUserService:
             # Path 3: PLAIN TEXT
             # ----------------------------------------------------------------
             if message_text:
-                await self.client.send_message(dest_entity, message_text)
+                _sent_txt = await self.client.send_message(dest_entity, message_text)
+                _record_sent_to_group(group_id, _sent_txt)
                 return True, None
 
             return False, "no_sendable_content"
