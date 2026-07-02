@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.group import Group, GroupStatus
@@ -74,3 +74,24 @@ class GroupRepository(BaseRepository[Group]):
             select(Group).order_by(Group.created_at.desc()).limit(limit).offset(offset)
         )
         return list(result.scalars().all())
+
+    async def mark_left_not_in(self, active_group_ids: set[int]) -> int:
+        """Mark as LEFT every group whose status is JOINED but whose group_id is
+        NOT in active_group_ids (the live Telethon dialog list).
+
+        Call this after every dialog sync so 'joined' always reflects exactly
+        the groups the account is currently a member of — no stale/left
+        groups inflate broadcast counts or stats. Returns rows updated.
+        """
+        if not active_group_ids:
+            # Safety guard: never wipe everyone if the live list came back empty
+            # (e.g. transient Telethon failure) — avoids mass-mislabeling groups.
+            return 0
+
+        result = await self._session.execute(
+            update(Group)
+            .where(Group.status == GroupStatus.JOINED)
+            .where(Group.group_id.not_in(active_group_ids))
+            .values(status=GroupStatus.LEFT)
+        )
+        return result.rowcount

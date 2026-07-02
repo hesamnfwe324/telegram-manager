@@ -12,6 +12,7 @@ class GroupStatus(str, enum.Enum):
     REJECTED = "rejected"
     JOINED = "joined"
     FAILED = "failed"
+    LEFT = "left"
 
 
 class Group(Base):

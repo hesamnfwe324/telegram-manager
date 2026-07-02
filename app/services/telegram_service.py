@@ -675,6 +675,7 @@ class TelegramUserService:
 
         all_groups = await self.get_all_groups_from_dialogs()
         new_count = 0
+        active_ids: set[int] = {g["group_id"] for g in all_groups}
 
         async with AsyncSessionLocal() as session:
             repo = GroupRepository(session)
@@ -689,9 +690,17 @@ class TelegramUserService:
                 )
                 if created:
                     new_count += 1
+            # Prune stale records: any group previously marked JOINED that is
+            # no longer among the live dialogs (left/removed/kicked) is moved
+            # to LEFT so it stops inflating "joined" counts used everywhere
+            # else (stats, broadcast target count).
+            left_count = await repo.mark_left_not_in(active_ids)
             await session.commit()
 
-        logger.info("sync_dialogs_to_db: %d total, %d new", len(all_groups), new_count)
+        logger.info(
+            "sync_dialogs_to_db: %d total, %d new, %d marked left",
+            len(all_groups), new_count, left_count,
+        )
         return new_count, len(all_groups)
 
     async def get_all_user_dialogs(self, limit: int = 3000) -> list[dict]:

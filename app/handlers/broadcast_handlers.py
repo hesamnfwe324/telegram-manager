@@ -140,8 +140,19 @@ async def receive_content(message: Message, state: FSMContext) -> None:
     label = "گروه‌ها" if target == "groups" else "کاربران"
 
     if target == "groups":
+        # Live count, not a DB snapshot: mirrors exactly what _send_to_groups
+        # will target (live Telethon dialogs, plus any DB-only joined groups
+        # not currently visible as dialogs). Using count_by_status(JOINED)
+        # here showed stale numbers whenever the DB still held groups the
+        # account had already left/been removed from since the last sync.
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        dialog_groups = await tg.get_all_groups_from_dialogs()
+        dialog_ids = {g["group_id"] for g in dialog_groups}
         async with AsyncSessionLocal() as session:
-            count = await GroupRepository(session).count_by_status(GroupStatus.JOINED)
+            db_groups = await GroupRepository(session).get_joined()
+        db_only = sum(1 for g in db_groups if g.group_id not in dialog_ids)
+        count = len(dialog_groups) + db_only
     else:
         # Use live PV dialogs as the count — identical to what _send_to_users will
         # actually send to.  DB count is intentionally NOT used here because the DB
