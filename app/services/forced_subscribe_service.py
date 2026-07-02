@@ -1,26 +1,34 @@
 """
 Forced-Subscribe Auto-Detection & Auto-Join Service.
 
-Some Telegram groups deploy "forced subscription" bots that prevent new
-members from sending messages until they join a specific channel or group.
-This service detects and resolves those restrictions automatically:
+Architecture:
+  1. process_message() — permanent global Telethon handler registered at startup.
+     Fires on every incoming group message. When a forced-subscribe restriction
+     is detected it attempts to auto-join the required channels/groups.
 
-  1. Permanent global listener (process_message) registered at startup.
-     Monitors ALL incoming messages in all groups. When any message looks
-     like a forced-subscribe notice it auto-joins the required targets.
+  2. check_after_join() — short-lived listener started right after a group join,
+     in case the group bot messages the account immediately on entry.
 
-  2. After a successful group join, listens for bot messages for up to
-     LISTEN_TIMEOUT seconds. If a forced-subscribe message is found, it
-     extracts the required channel/group links and auto-joins them.
+  3. handle_write_forbidden() — called when send_message_to_group_advanced()
+     raises ChatWriteForbiddenError. Scans recent history for a restriction
+     notice and auto-joins the required targets.
 
-  3. When send_message_to_group_advanced() encounters ChatWriteForbiddenError,
-     it calls handle_write_forbidden(), which scans recent group history for
-     forced-subscribe instructions and auto-joins the required targets.
+Anti-spam guarantees (stops the notification flood seen in production):
+  - Group-level cooldown: after processing a group, don't process it again
+    until at least _GROUP_COOLDOWN_MIN seconds have passed (or until the
+    shortest flood-wait among its targets expires).
+  - Target-level flood-wait tracking: when Telegram rate-limits a join attempt
+    with FloodWaitError, the target is remembered until the wait expires —
+    never retried early, never notified again during the wait.
+  - Consolidated notifications: one summary per group run, not one per target.
+  - Notification deduplication: the same (group, target) failure is never
+    reported more than once per _NOTIFY_COOLDOWN seconds.
 """
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 from app.utils.logger import get_logger
@@ -32,17 +40,12 @@ logger = get_logger(__name__)
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
 
-# Private invite links: t.me/+ or t.me/joinchat/
 _PRIVATE_INVITE_RE = re.compile(
     r"t\.me/(?:joinchat/|\+)([a-zA-Z0-9_-]+)", re.I
 )
-
-# Public t.me/<username> links
 _PUBLIC_TGME_RE = re.compile(
     r"t\.me/([a-zA-Z][a-zA-Z0-9_]{3,31})(?:\b|$)", re.I
 )
-
-# @username mentions
 _AT_USERNAME_RE = re.compile(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
 # ── Heuristic keywords ────────────────────────────────────────────────────────
@@ -56,21 +59,30 @@ _SUBSCRIBE_KEYWORDS = (
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 
+# Seconds to listen for bot messages right after joining a group
 _LISTEN_TIMEOUT: int = 30
+
+# Recent messages to scan when ChatWriteForbiddenError is raised
 _HISTORY_SCAN_LIMIT: int = 25
+
+# Seconds to wait between consecutive join calls (anti-flood)
 _AUTO_JOIN_DELAY: float = 2.0
+
+# Minimum group cooldown (seconds) after any processing run.
+# Prevents re-processing the same group faster than this, even on success.
+_GROUP_COOLDOWN_MIN: float = 300.0  # 5 minutes
+
+# How long (seconds) before we re-send the same failure notification.
+# This is the hard floor — flood_wait durations will extend it further.
+_NOTIFY_COOLDOWN: float = 3600.0  # 1 hour
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_urls_from_buttons(message: Any) -> list[str]:
-    """
-    Extract all URLs from InlineKeyboard buttons attached to a message.
-    Most forced-subscribe bots put the channel link in a button, not in text.
-    """
+    """Extract all URLs from InlineKeyboard buttons (message.buttons or raw reply_markup)."""
     urls: list[str] = []
     try:
-        # Try message.buttons (Telethon event)
         buttons = getattr(message, "buttons", None)
         if buttons:
             for row in buttons:
@@ -82,9 +94,7 @@ def _extract_urls_from_buttons(message: Any) -> list[str]:
                         urls.append(url)
     except Exception:
         pass
-
     try:
-        # Fallback: raw reply_markup
         markup = getattr(message, "reply_markup", None)
         if markup:
             for row in getattr(markup, "rows", []):
@@ -94,12 +104,11 @@ def _extract_urls_from_buttons(message: Any) -> list[str]:
                         urls.append(url)
     except Exception:
         pass
-
     return urls
 
 
 def _extract_targets_from_text(text: str) -> list[str]:
-    """Extract joinable identifiers from a text string."""
+    """Extract joinable identifiers (@username / t.me links) from plain text."""
     targets: list[str] = []
     seen: set[str] = set()
 
@@ -127,11 +136,7 @@ def _extract_targets_from_text(text: str) -> list[str]:
 
 
 def _extract_targets(message: Any, text: str) -> list[str]:
-    """
-    Extract joinable targets from BOTH the message text and any InlineKeyboard
-    buttons. Buttons take priority because forced-subscribe bots almost always
-    embed the link there.
-    """
+    """Extract joinable targets from message text AND InlineKeyboard button URLs."""
     seen: set[str] = set()
     result: list[str] = []
 
@@ -141,12 +146,12 @@ def _extract_targets(message: Any, text: str) -> list[str]:
             seen.add(key)
             result.append(t)
 
-    # 1. Button URLs (highest priority)
+    # Button URLs first (most reliable for forced-subscribe bots)
     for url in _extract_urls_from_buttons(message):
         for t in _extract_targets_from_text(url):
             _add(t)
 
-    # 2. Text links / @mentions
+    # Then text-embedded links / @mentions
     for t in _extract_targets_from_text(text):
         _add(t)
 
@@ -154,19 +159,11 @@ def _extract_targets(message: Any, text: str) -> list[str]:
 
 
 def _looks_like_forced_subscribe(text: str, message: Any = None) -> bool:
-    """
-    Return True if the message looks like a forced-subscribe restriction notice.
-    Positive if:
-      - text contains a keyword AND (text has a link OR message has button URLs)
-      - OR message has button URLs that look like channel/group links AND any keyword is present
-    """
+    """Return True if the message looks like a forced-subscribe restriction notice."""
     text_lower = text.lower()
-    has_keyword = any(kw in text_lower for kw in _SUBSCRIBE_KEYWORDS)
-
-    if not has_keyword:
+    if not any(kw in text_lower for kw in _SUBSCRIBE_KEYWORDS):
         return False
 
-    # Has link in text?
     has_text_link = bool(
         _PRIVATE_INVITE_RE.search(text)
         or _PUBLIC_TGME_RE.search(text)
@@ -175,13 +172,22 @@ def _looks_like_forced_subscribe(text: str, message: Any = None) -> bool:
     if has_text_link:
         return True
 
-    # Has button with a Telegram link?
     if message is not None:
         button_urls = _extract_urls_from_buttons(message)
         if any("t.me" in u or "telegram.me" in u for u in button_urls):
             return True
 
     return False
+
+
+def _parse_flood_wait_seconds(error: str | None) -> float | None:
+    """Parse 'flood_wait:Ns' → N (float). Returns None if not a flood_wait error."""
+    if not error or not error.startswith("flood_wait:"):
+        return None
+    try:
+        return float(error.split(":", 1)[1].rstrip("s"))
+    except (IndexError, ValueError):
+        return None
 
 
 # ── Service ───────────────────────────────────────────────────────────────────
@@ -193,8 +199,22 @@ class ForcedSubscribeService:
 
     def __init__(self) -> None:
         self._tg: TelegramUserService | None = None
-        # Tracks groups currently being processed to avoid duplicate auto-joins
+
+        # In-flight: group_ids currently being processed (prevent concurrent runs)
         self._handling: set[int] = set()
+
+        # Group-level cooldown: group_id → monotonic expiry timestamp.
+        # After a processing run, the group is silently skipped until expiry.
+        # Expiry = max(GROUP_COOLDOWN_MIN, min remaining flood_wait of its targets).
+        self._group_cooldown: dict[int, float] = {}
+
+        # Target-level flood-wait: normalised_target → monotonic expiry timestamp.
+        # Set when join_group() returns flood_wait:Ns; cleared when expiry passes.
+        self._flood_until: dict[str, float] = {}
+
+        # Notification dedup: (group_id, normalised_target) → last sent (monotonic).
+        # Prevents sending the same failure notification repeatedly.
+        self._last_notified: dict[tuple[int, str], float] = {}
 
     @classmethod
     def get_instance(cls) -> ForcedSubscribeService:
@@ -205,22 +225,41 @@ class ForcedSubscribeService:
     def set_tg_service(self, tg: TelegramUserService) -> None:
         self._tg = tg
 
+    # ── Cooldown / flood-wait helpers ─────────────────────────────────────────
+
+    def _group_is_cooling(self, group_id: int) -> bool:
+        return time.monotonic() < self._group_cooldown.get(group_id, 0.0)
+
+    def _set_group_cooldown(self, group_id: int, seconds: float) -> None:
+        self._group_cooldown[group_id] = time.monotonic() + max(seconds, _GROUP_COOLDOWN_MIN)
+
+    def _target_flood_remaining(self, target: str) -> float:
+        """Seconds remaining in flood_wait for *target*. 0 if not rate-limited."""
+        expiry = self._flood_until.get(target.lower(), 0.0)
+        return max(0.0, expiry - time.monotonic())
+
+    def _set_target_flood(self, target: str, seconds: float) -> None:
+        self._flood_until[target.lower()] = time.monotonic() + seconds
+
+    def _should_notify(self, group_id: int, target: str) -> bool:
+        key = (group_id, target.lower())
+        last = self._last_notified.get(key, 0.0)
+        return time.monotonic() - last >= _NOTIFY_COOLDOWN
+
+    def _mark_notified(self, group_id: int, target: str) -> None:
+        self._last_notified[(group_id, target.lower())] = time.monotonic()
+
     # ── Permanent global listener ─────────────────────────────────────────────
 
     async def process_message(self, event: Any) -> None:
         """
-        Permanent handler registered at startup (like DiscoveryService).
-        Monitors ALL incoming messages across all groups and auto-resolves
-        forced-subscribe restrictions as soon as they appear — regardless of
-        whether we just joined or are in the middle of a broadcast.
+        Permanent Telethon handler registered at startup.
+        Detects forced-subscribe restrictions in ANY group message and auto-joins.
 
-        We do NOT filter by is_bot because:
-        - Some forced-subscribe bots are anonymous admins (bot=False)
-        - Some groups use service messages (no sender)
-        - Missing a valid detection is worse than a false positive
+        Anti-spam: group cooldown + target flood_wait tracking + notification dedup.
         """
         try:
-            # Only act in group/supergroup chats — never in DMs or channels
+            # Only act in group/supergroup chats
             if not event.is_group:
                 return
 
@@ -236,7 +275,6 @@ class ForcedSubscribeService:
                 or ""
             )
 
-            # Skip completely empty messages with no buttons
             button_urls = _extract_urls_from_buttons(msg)
             if not text and not button_urls:
                 return
@@ -246,22 +284,27 @@ class ForcedSubscribeService:
 
             targets = _extract_targets(msg, text)
             if not targets:
-                logger.debug(
-                    "ForcedSubscribe[global]: keyword+link match in group %s "
-                    "but no joinable targets extracted. text=%r buttons=%r",
-                    event.chat_id, text[:120], button_urls,
-                )
                 return
 
             group_id: int = event.chat_id
+
+            # ── Guard 1: in-flight (concurrent processing) ────────────────
             if group_id in self._handling:
-                return  # already processing this group
+                return
+
+            # ── Guard 2: group cooldown (recent run) ──────────────────────
+            if self._group_is_cooling(group_id):
+                logger.debug(
+                    "ForcedSubscribe[global]: group %d on cooldown for %.0fs — skipping",
+                    group_id,
+                    self._group_cooldown.get(group_id, 0.0) - time.monotonic(),
+                )
+                return
 
             sender_id = getattr(msg, "sender_id", None)
             logger.info(
-                "ForcedSubscribe[global]: restriction detected in group %d "
-                "(sender_id=%s) — targets: %s | text: %r",
-                group_id, sender_id, targets, text[:100],
+                "ForcedSubscribe[global]: restriction in group %d (sender=%s) targets=%s",
+                group_id, sender_id, targets,
             )
 
             self._handling.add(group_id)
@@ -297,9 +340,11 @@ class ForcedSubscribeService:
         try:
             found = asyncio.Event()
 
-            async def _handler(event: Any) -> None:  # type: ignore[type-arg]
+            async def _handler(event: Any) -> None:
                 nonlocal auto_joined
                 if event.chat_id != group_id:
+                    return
+                if getattr(event.message, "out", False):
                     return
 
                 msg = event.message
@@ -309,11 +354,6 @@ class ForcedSubscribeService:
                     or ""
                 )
 
-                logger.debug(
-                    "ForcedSubscribe[check_after_join]: msg in group %d: %r",
-                    group_id, text[:80],
-                )
-
                 if not _looks_like_forced_subscribe(text, msg):
                     return
 
@@ -321,11 +361,9 @@ class ForcedSubscribeService:
                 if not targets:
                     return
 
-                sender_id = getattr(msg, "sender_id", None)
                 logger.info(
-                    "ForcedSubscribe[check_after_join]: restriction in group %d "
-                    "(sender=%s) — targets: %s",
-                    group_id, sender_id, targets,
+                    "ForcedSubscribe[check_after_join]: restriction in group %d — targets=%s",
+                    group_id, targets,
                 )
 
                 if group_id not in self._handling:
@@ -344,7 +382,7 @@ class ForcedSubscribeService:
                 await asyncio.wait_for(found.wait(), timeout=_LISTEN_TIMEOUT)
             except asyncio.TimeoutError:
                 logger.debug(
-                    "ForcedSubscribe[check_after_join]: no restriction message in %ds for group %d",
+                    "ForcedSubscribe[check_after_join]: no restriction in %ds for group %d",
                     _LISTEN_TIMEOUT, group_id,
                 )
             finally:
@@ -362,16 +400,18 @@ class ForcedSubscribeService:
         self, group_id: int, group_title: str | None = None
     ) -> list[str]:
         """
-        Called when ChatWriteForbiddenError is raised while trying to send
-        to *group_id*. Scans recent group messages for forced-subscribe
-        instructions and auto-joins required channels/groups.
-
-        Key fix: also parses InlineKeyboard button URLs (not just message text),
-        and does NOT filter by sender (any message type is considered).
-
-        Returns a list of channel/group targets that were successfully joined.
+        Called when ChatWriteForbiddenError is raised. Scans recent group history
+        for forced-subscribe messages and auto-joins required targets.
         """
         if self._tg is None:
+            return []
+
+        # Skip if group is cooling down or already in-flight
+        if self._group_is_cooling(group_id) or group_id in self._handling:
+            logger.debug(
+                "ForcedSubscribe[write-forbidden]: group %d on cooldown/in-flight — skip",
+                group_id,
+            )
             return []
 
         auto_joined: list[str] = []
@@ -379,7 +419,7 @@ class ForcedSubscribeService:
             detected_targets: list[str] = []
 
             logger.info(
-                "ForcedSubscribe[write-forbidden]: scanning last %d messages in group %d (%r)",
+                "ForcedSubscribe[write-forbidden]: scanning %d messages in group %d (%r)",
                 _HISTORY_SCAN_LIMIT, group_id, group_title,
             )
 
@@ -391,13 +431,11 @@ class ForcedSubscribeService:
                     or getattr(message, "message", None)
                     or ""
                 )
-                button_urls = _extract_urls_from_buttons(message)
-
-                # Log every message scanned for debugging
-                sender_id = getattr(message, "sender_id", None)
                 logger.debug(
                     "ForcedSubscribe[scan] sender=%s text=%r buttons=%r",
-                    sender_id, text[:80], button_urls,
+                    getattr(message, "sender_id", None),
+                    text[:80],
+                    _extract_urls_from_buttons(message),
                 )
 
                 if not _looks_like_forced_subscribe(text, message):
@@ -406,12 +444,11 @@ class ForcedSubscribeService:
                 targets = _extract_targets(message, text)
                 if targets:
                     logger.info(
-                        "ForcedSubscribe[write-forbidden]: match found in group %d — "
-                        "sender=%s targets=%s text=%r",
-                        group_id, sender_id, targets, text[:100],
+                        "ForcedSubscribe[write-forbidden]: match in group %d — targets=%s",
+                        group_id, targets,
                     )
                     detected_targets.extend(targets)
-                    break  # stop at first high-confidence match
+                    break
 
             if detected_targets:
                 seen: set[str] = set()
@@ -419,9 +456,9 @@ class ForcedSubscribeService:
                 auto_joined = await self._join_targets(unique, group_id, group_title)
             else:
                 logger.warning(
-                    "ForcedSubscribe[write-forbidden]: no forced-subscribe message found "
-                    "in last %d messages of group %d. The group may use native Telegram "
-                    "channel subscription enforcement — cannot auto-detect target channel.",
+                    "ForcedSubscribe[write-forbidden]: no restriction message found in "
+                    "last %d messages of group %d. Possibly native Telegram channel "
+                    "enforcement (no bot message) — cannot auto-detect target.",
                     _HISTORY_SCAN_LIMIT, group_id,
                 )
 
@@ -442,89 +479,160 @@ class ForcedSubscribeService:
         source_group_title: str | None,
     ) -> list[str]:
         """
-        Attempt to join each target. Returns the list of successfully joined
-        channels/groups.
+        Attempt to join each target channel/group.
 
-        NOTE: We do NOT validate entity type before joining. Calling get_entity()
-        on a channel we're not yet a member of can raise errors and cause us to
-        skip valid targets. Instead we try to join and let join_group() handle errors.
+        Key behaviours:
+        - Targets still in flood_wait are silently skipped (no retry, no spam).
+        - A single summary notification is sent per run (not per target).
+        - Group cooldown is set after the run to prevent immediate re-trigger.
         """
         if self._tg is None:
             return []
 
         joined: list[str] = []
+        failed: list[tuple[str, str]] = []   # (target, error)
+        skipped_flood: list[tuple[str, float]] = []  # (target, remaining_secs)
+        min_flood_wait: float = 0.0  # track shortest flood_wait to set group cooldown
 
         for target in targets:
+            # ── Check target flood_wait ───────────────────────────────────
+            remaining = self._target_flood_remaining(target)
+            if remaining > 0:
+                logger.debug(
+                    "ForcedSubscribe: skipping %r — flood_wait %.0fs remaining",
+                    target, remaining,
+                )
+                skipped_flood.append((target, remaining))
+                if min_flood_wait == 0.0 or remaining < min_flood_wait:
+                    min_flood_wait = remaining
+                continue
+
             try:
                 logger.info(
-                    "ForcedSubscribe: attempting to join %r (required by group %d %r)",
+                    "ForcedSubscribe: joining %r (required by group %d %r)",
                     target, source_group_id, source_group_title,
                 )
                 success, _, error = await self._tg.join_group(target)
+
                 if success:
                     logger.info(
-                        "ForcedSubscribe: ✅ auto-joined %r (required by group %d %r)",
-                        target, source_group_id, source_group_title,
+                        "ForcedSubscribe: ✅ joined %r (required by group %d)",
+                        target, source_group_id,
                     )
                     joined.append(target)
-                    await self._notify(
-                        source_group_id, source_group_title,
-                        target, joined=True, error=None,
-                    )
                 else:
-                    logger.warning(
-                        "ForcedSubscribe: ⚠️ failed to join %r required by group %d: %s",
-                        target, source_group_id, error,
-                    )
-                    await self._notify(
-                        source_group_id, source_group_title,
-                        target, joined=False, error=error,
-                    )
+                    flood_secs = _parse_flood_wait_seconds(error)
+                    if flood_secs is not None:
+                        logger.warning(
+                            "ForcedSubscribe: flood_wait %.0fs for %r — will retry after wait",
+                            flood_secs, target,
+                        )
+                        self._set_target_flood(target, flood_secs)
+                        skipped_flood.append((target, flood_secs))
+                        if min_flood_wait == 0.0 or flood_secs < min_flood_wait:
+                            min_flood_wait = flood_secs
+                    else:
+                        logger.warning(
+                            "ForcedSubscribe: ⚠️ failed to join %r: %s",
+                            target, error,
+                        )
+                        failed.append((target, error or "unknown"))
 
                 await asyncio.sleep(_AUTO_JOIN_DELAY)
 
             except Exception as exc:
                 logger.error(
-                    "ForcedSubscribe._join_targets: unexpected error for %r: %s",
-                    target, exc,
+                    "ForcedSubscribe._join_targets: error for %r: %s", target, exc,
                 )
+                failed.append((target, str(exc)))
+
+        # ── Set group cooldown ────────────────────────────────────────────
+        # If ALL targets are in flood_wait, cool down until the shortest one expires.
+        # Otherwise use _GROUP_COOLDOWN_MIN (5 min) so we re-check soon.
+        all_flood = len(skipped_flood) == len(targets) and len(joined) == 0 and len(failed) == 0
+        if all_flood and min_flood_wait > 0:
+            cooldown_secs = min_flood_wait
+        else:
+            cooldown_secs = _GROUP_COOLDOWN_MIN
+
+        self._set_group_cooldown(source_group_id, cooldown_secs)
+        logger.debug(
+            "ForcedSubscribe: group %d cooldown set to %.0fs",
+            source_group_id, cooldown_secs,
+        )
+
+        # ── Send ONE consolidated notification ────────────────────────────
+        await self._notify_summary(
+            source_group_id, source_group_title,
+            joined=joined,
+            failed=failed,
+            skipped_flood=skipped_flood,
+        )
 
         return joined
 
-    async def _notify(
+    async def _notify_summary(
         self,
-        source_group_id: int,
-        source_group_title: str | None,
-        target: str,
-        joined: bool,
-        error: str | None,
+        group_id: int,
+        group_title: str | None,
+        joined: list[str],
+        failed: list[tuple[str, str]],
+        skipped_flood: list[tuple[str, float]],
     ) -> None:
-        """Send an admin notification about a forced-subscribe auto-join action."""
+        """Send a single consolidated notification for one processing run."""
         try:
-            from app.services.notification_service import NotificationService
+            # Check if there's anything worth notifying about
+            # - Successes: always notify
+            # - Failures: notify only if not already notified recently
+            notify_failures = [
+                (t, e) for t, e in failed
+                if self._should_notify(group_id, t)
+            ]
+            notify_floods = [
+                (t, r) for t, r in skipped_flood
+                if self._should_notify(group_id, t)
+            ]
 
+            if not joined and not notify_failures and not notify_floods:
+                logger.debug(
+                    "ForcedSubscribe._notify_summary: all notifications suppressed "
+                    "(dedup) for group %d", group_id,
+                )
+                return
+
+            from app.services.notification_service import NotificationService
             ns = NotificationService.get_instance()
+
             group_label = (
-                f"<b>{source_group_title}</b>"
-                if source_group_title
-                else f"<code>{source_group_id}</code>"
+                f"<b>{group_title}</b>" if group_title
+                else f"<code>{group_id}</code>"
             )
 
-            if joined:
-                text = (
-                    f"🔗 <b>Forced-Subscribe: عضویت خودکار</b>\n\n"
-                    f"گروه: {group_label}\n"
-                    f"کانال/گروه مورد نیاز: <code>{target}</code>\n"
-                    f"وضعیت: ✅ عضو شدیم — محدودیت برداشته شد"
-                )
-            else:
-                text = (
-                    f"⚠️ <b>Forced-Subscribe: عضویت ناموفق</b>\n\n"
-                    f"گروه: {group_label}\n"
-                    f"کانال/گروه مورد نیاز: <code>{target}</code>\n"
-                    f"خطا: <code>{error or 'نامشخص'}</code>"
-                )
+            lines: list[str] = [f"🔔 <b>Forced-Subscribe — {group_label}</b>\n"]
 
-            await ns.notify(text, parse_mode="HTML")
+            if joined:
+                lines.append("✅ <b>عضویت موفق:</b>")
+                for t in joined:
+                    lines.append(f"  • <code>{t}</code>")
+                lines.append("")
+
+            if notify_failures:
+                lines.append("❌ <b>عضویت ناموفق:</b>")
+                for t, e in notify_failures:
+                    lines.append(f"  • <code>{t}</code> — <code>{e}</code>")
+                    self._mark_notified(group_id, t)
+                lines.append("")
+
+            if notify_floods:
+                lines.append("⏳ <b>محدودیت موقت (FloodWait):</b>")
+                for t, r in notify_floods:
+                    h = int(r // 3600)
+                    m = int((r % 3600) // 60)
+                    wait_str = f"{h}h {m}m" if h else f"{m}m"
+                    lines.append(f"  • <code>{t}</code> — تلاش مجدد در {wait_str}")
+                    self._mark_notified(group_id, t)
+
+            await ns.notify("\n".join(lines), parse_mode="HTML")
+
         except Exception as exc:
-            logger.error("ForcedSubscribe._notify error: %s", exc)
+            logger.error("ForcedSubscribe._notify_summary error: %s", exc)
