@@ -425,6 +425,18 @@ class BroadcastQueueService:
                 job.failed += 1
                 if job.first_group_error is None:
                     job.first_group_error = f"gid={group_id}: {reason}"
+                if reason == "peer_flood":
+                    job.error = "پیر فلاد: اکانت موقتاً محدود شد. broadcast متوقف شد."
+                    logger.error("Broadcast job %s stopped due to PeerFloodError", job.job_id)
+                    await self._log("broadcast_group_failed", "error", actor, str(group_id), reason)
+                    return
+                elif reason and reason.startswith("flood_wait:"):
+                    try:
+                        wait_secs = int(reason.split(":")[1].rstrip("s"))
+                    except Exception:
+                        wait_secs = 60
+                    logger.warning("FloodWait %ds — sleeping before next group", wait_secs)
+                    await asyncio.sleep(wait_secs)
                 await self._log("broadcast_group_failed", "error", actor, str(group_id), reason)
 
             done_count = idx + 1
