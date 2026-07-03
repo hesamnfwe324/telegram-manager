@@ -117,6 +117,24 @@ class HealthService:
             self._alerted = False
 
         except Exception as exc:
+            # ── FloodWait: account is healthy, just rate-limited by Telegram ──
+            # Do NOT count as failure — client is connected, Telegram throttling.
+            exc_str = str(exc)
+            is_flood = (
+                "FloodWait" in type(exc).__name__
+                or "A wait of" in exc_str
+                or "flood" in exc_str.lower()
+            )
+            if is_flood:
+                logger.info(
+                    "Health check: Telegram rate-limit (FloodWait) — "
+                    "client is connected, skipping failure count. detail: %s",
+                    exc_str,
+                )
+                # Still mark last_ok so dashboard shows client is alive
+                self._last_ok = datetime.now(timezone.utc)
+                return
+
             self._consecutive_failures += 1
             logger.warning(
                 "Health check failed (consecutive=%d): %s",
