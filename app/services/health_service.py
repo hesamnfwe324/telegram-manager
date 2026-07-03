@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 
 CHECK_INTERVAL = 60          # seconds between health checks
 SOFT_BAN_THRESHOLD = 3       # consecutive failures before alert
-MESSAGE_TIMEOUT = 15         # seconds to wait for Telegram API response
+MESSAGE_TIMEOUT = 30         # seconds to wait for Telegram API response
 RECONNECT_COOLDOWN = 30      # seconds to wait before retrying a failed reconnect
 
 
