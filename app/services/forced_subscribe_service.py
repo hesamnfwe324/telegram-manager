@@ -903,7 +903,10 @@ class ForcedSubscribeService:
                 (t, r) for t, r in skipped_flood if self._should_notify(group_id, t)
             ]
 
-            if not joined and not notify_failures and not notify_floods:
+            # Only report problems (failed joins / temporary restrictions).
+            # Successful forced-subscribe joins are NOT reported — the admin
+            # only wants to know about groups/channels that have issues.
+            if not notify_failures and not notify_floods:
                 return
 
             from app.services.notification_service import NotificationService
@@ -913,12 +916,6 @@ class ForcedSubscribeService:
                 f"<b>{group_title}</b>" if group_title else f"<code>{group_id}</code>"
             )
             lines: list[str] = [f"🔔 <b>Forced-Subscribe — {group_label}</b>\n"]
-
-            if joined:
-                lines.append("✅ <b>عضویت موفق:</b>")
-                for t in joined:
-                    lines.append(f"  • <code>{t}</code>")
-                lines.append("")
 
             if notify_failures:
                 lines.append("❌ <b>عضویت ناموفق:</b>")

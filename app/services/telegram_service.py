@@ -1,4 +1,5 @@
 import asyncio
+import random
 import re
 from io import BytesIO
 from typing import Any
@@ -90,6 +91,15 @@ def _record_sent_to_group(group_id: int, message_or_list: Any) -> None:
 class TelegramUserService:
     _instance: "TelegramUserService | None" = None
 
+    # ── Global join throttle ──────────────────────────────────────────────
+    # Applies to EVERY join_group() call regardless of caller (main discovery
+    # queue OR forced-subscribe auto-join). Without this, forced-subscribe
+    # could fire several joins seconds apart -- independent of the main
+    # queue's pacing -- creating a burst pattern that looks like spam to
+    # Telegram and triggers temporary restrictions / soft-bans.
+    _GLOBAL_JOIN_MIN_GAP = 90.0   # seconds
+    _GLOBAL_JOIN_MAX_GAP = 180.0  # seconds
+
     def __init__(self) -> None:
         session = (
             StringSession(settings.TELEGRAM_SESSION_STRING)
@@ -105,6 +115,29 @@ class TelegramUserService:
             auto_reconnect=True,
         )
         self._running = False
+        self._join_lock = asyncio.Lock()
+        self._last_join_at: float = 0.0
+
+    async def _throttle_join(self) -> None:
+        """
+        Enforce a randomized minimum gap between ANY two join_group() calls,
+        no matter which service triggered them. This is the account-wide
+        safety net against join bursts.
+        """
+        async with self._join_lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            if self._last_join_at > 0:
+                min_gap = random.uniform(self._GLOBAL_JOIN_MIN_GAP, self._GLOBAL_JOIN_MAX_GAP)
+                elapsed = now - self._last_join_at
+                if elapsed < min_gap:
+                    wait = min_gap - elapsed
+                    logger.info(
+                        "Global join throttle: waiting %.0fs before next join (any source)",
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+            self._last_join_at = loop.time()
 
     @classmethod
     def get_instance(cls) -> "TelegramUserService":
@@ -212,6 +245,7 @@ class TelegramUserService:
         error_message is the exact Telethon exception type + text so callers
         can store it in the DB for later diagnosis.
         """
+        await self._throttle_join()
         try:
             m = _PRIVATE_INVITE_RE.search(link)
             if m:

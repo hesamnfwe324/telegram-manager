@@ -295,7 +295,9 @@ class JoinQueueService:
 
             await session.commit()
 
-        if settings.get_admin_id_list():
+        # Only notify admins about FAILED joins. Successful joins are silent —
+        # the admin only wants to know about groups that have a problem.
+        if settings.get_admin_id_list() and not success:
             await self._notify_admins(task, success)
 
         # ── Forced-Subscribe detection ────────────────────────────────────
