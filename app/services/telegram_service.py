@@ -490,11 +490,8 @@ class TelegramUserService:
             return False, "no_sendable_content"
 
         except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
-            # Try to resolve forced-subscribe restrictions automatically
-            asyncio.create_task(
-                self._handle_forced_subscribe(group_id),
-                name=f"forced-subscribe-write-forbidden-{group_id}",
-            )
+            # Forced-subscribe disabled — just log and return
+            logger.warning("ChatWriteForbiddenError in group %d — skipping (forced-subscribe disabled)", group_id)
             return False, f"no_write_permission: {exc}"
         except FloodWaitError as exc:
             logger.warning(
