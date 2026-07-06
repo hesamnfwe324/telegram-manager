@@ -95,3 +95,16 @@ class GroupRepository(BaseRepository[Group]):
             .values(status=GroupStatus.LEFT)
         )
         return result.rowcount
+
+    async def get_by_status_paged(
+        self, status: "GroupStatus", limit: int = 15, offset: int = 0
+    ) -> list[Group]:
+        """DB-level paginated fetch for a given status (avoids loading all rows)."""
+        result = await self._session.execute(
+            select(Group)
+            .where(Group.status == status)
+            .order_by(Group.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(result.scalars().all())

@@ -1,24 +1,29 @@
 """
-JoinApprovalWatcher — notifies admins when a pending join request gets approved.
+Watches for ChatAction events where our Telegram account is added/approved
+into a group, then updates the group record in the DB to JOINED status.
 
-When a group requires admin approval and the account sends a join request,
-Telethon raises InviteRequestSentError (treated as success by JoinQueueService).
-Later, when the group admin accepts the request, Telegram sends a ChatAction
-event that the user was added. This service listens for those events and sends
-a notification so the admin knows the account is now inside the group.
+This fixes the critical bug where:
+  1. Admin approves a group via bot → status set to APPROVED (correct)
+  2. Bot enqueues group for joining → join request sent to Telegram
+  3. Group admin approves the join request → Telethon receives ChatAction event
+  4. *** BUG: DB status stays APPROVED forever — never updated to JOINED ***
+
+This service fixes step 4 by listening for the approval event and
+immediately marking the group JOINED in the DB.
 """
 import asyncio
 from typing import Any
 
 from app.database.connection import AsyncSessionLocal
 from app.repositories import GroupRepository, LogRepository
+from app.models.group import GroupStatus
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class JoinApprovalWatcher:
-    """Singleton that watches for approved join requests via Telethon ChatAction events."""
+    """Listens for Telethon ChatAction events where our account is approved."""
 
     _instance: "JoinApprovalWatcher | None" = None
 
@@ -77,11 +82,52 @@ class JoinApprovalWatcher:
                 group = await group_repo.get_by_group_id(chat_id)
                 title = (group.title if group else None) or str(chat_id)
 
+                # ── CRITICAL FIX: Update group status to JOINED ────────────────
+                # Previously this only logged the event but never updated the DB,
+                # leaving APPROVED groups stuck in APPROVED status forever.
+                if group is not None and group.status == GroupStatus.APPROVED:
+                    from datetime import datetime, timezone
+                    group.status = GroupStatus.JOINED
+                    group.join_date = datetime.now(timezone.utc)
+                    logger.info(
+                        "JoinApprovalWatcher: group_id=%d (%r) status updated APPROVED → JOINED",
+                        chat_id, title,
+                    )
+                elif group is not None and group.status == GroupStatus.PENDING:
+                    # Can also happen for groups joining without explicit approval step
+                    from datetime import datetime, timezone
+                    group.status = GroupStatus.JOINED
+                    group.join_date = datetime.now(timezone.utc)
+                    logger.info(
+                        "JoinApprovalWatcher: group_id=%d (%r) status updated PENDING → JOINED",
+                        chat_id, title,
+                    )
+                elif group is None:
+                    # Unknown group — create a record so it shows up in the DB
+                    from app.models.group import Group
+                    from datetime import datetime, timezone
+                    try:
+                        new_group = Group(
+                            group_id=chat_id,
+                            title=title,
+                            status=GroupStatus.JOINED,
+                            join_date=datetime.now(timezone.utc),
+                        )
+                        session.add(new_group)
+                        logger.info(
+                            "JoinApprovalWatcher: auto-created JOINED record for unknown group_id=%d",
+                            chat_id,
+                        )
+                    except Exception as create_exc:
+                        logger.warning(
+                            "JoinApprovalWatcher: could not auto-create group record: %s", create_exc
+                        )
+
                 await log_repo.add(
                     action="join_request_approved",
                     result="success",
                     target=str(chat_id),
-                    details=f"group_id={chat_id} title={title!r} approved_by_admin",
+                    details=f"group_id={chat_id} title={title!r} approved_by_admin → status=JOINED",
                 )
                 await session.commit()
 
@@ -96,8 +142,8 @@ class JoinApprovalWatcher:
             ns = NotificationService.get_instance()
             await ns.notify(
                 f"🎉 <b>درخواست عضویت تأیید شد!</b>\n\n"
-                f"ادمین گروه درخواست عضویت شما را تأیید کرد.\n"
-                f"اکانت اکنون داخل گروه است.\n\n"
+                f"ادمین گروه درخواست عضویت را تأیید کرد.\n"
+                f"اکانت اکنون داخل گروه است و وضعیت به <b>JOINED</b> تغییر یافت.\n\n"
                 f"📌 گروه: <code>{title}</code>\n"
                 f"🆔 شناسه: <code>{chat_id}</code>",
                 parse_mode="HTML",

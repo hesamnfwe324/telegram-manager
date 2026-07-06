@@ -304,6 +304,7 @@ class BroadcastQueueService:
         except Exception as exc:
             logger.warning("Could not send initial progress message: %s", exc)
 
+        peer_flood_count = 0
         for idx, user in enumerate(target_users):
             user_id = user["user_id"]
             ok, reason = await tg.send_dm_to_user(
@@ -331,10 +332,31 @@ class BroadcastQueueService:
                     job.deactivated += 1
                     await self._mark_user_blocked(user_id)
                 elif reason == "peer_flood":
-                    job.error = "پیر فلاد: اکانت موقتاً محدود شد. broadcast متوقف شد."
-                    logger.error("Broadcast job %s stopped due to PeerFloodError", job.job_id)
+                    peer_flood_count += 1
+                    logger.warning(
+                        "PeerFlood hit #%d for user %d in broadcast job %s — pausing %ds",
+                        peer_flood_count, user_id, job.job_id, settings.PEER_FLOOD_PAUSE_SECONDS,
+                    )
                     await self._log("broadcast_user_failed", "error", actor, str(user_id), reason)
-                    return
+                    if peer_flood_count >= settings.MAX_PEER_FLOOD_PAUSES:
+                        job.error = (
+                            f"PeerFlood {peer_flood_count}x: اکانت محدود شد. "
+                            "broadcast متوقف شد. چند ساعت صبر کنید."
+                        )
+                        logger.error("Broadcast job %s aborted after %d PeerFlood errors", job.job_id, peer_flood_count)
+                        return
+                    try:
+                        await job.bot.send_message(
+                            job.actor_id,
+                            f"⚠️ <b>PeerFlood #{peer_flood_count}</b>\n"
+                            f"{settings.PEER_FLOOD_PAUSE_SECONDS // 60} دقیقه صبر می‌کنم...\n"
+                            f"(حداکثر {settings.MAX_PEER_FLOOD_PAUSES} بار)",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(settings.PEER_FLOOD_PAUSE_SECONDS)
+                    await self._log("broadcast_user_failed", "error", actor, str(user_id), reason)
                 elif reason and reason.startswith("flood_wait:"):
                     try:
                         wait_secs = int(reason.split(":")[1].rstrip("s"))
@@ -347,7 +369,7 @@ class BroadcastQueueService:
             done_count = idx + 1
             if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
                 await self._send_progress(job, done_count)
-            await asyncio.sleep(TG_DM_DELAY)
+                        await asyncio.sleep(settings.TG_DM_DELAY_SECONDS)
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
         from app.services.telegram_service import TelegramUserService

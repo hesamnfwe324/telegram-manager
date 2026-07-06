@@ -1,5 +1,5 @@
 """
-Sequential join queue with random jitter and daily rate-limit.
+Sequential join queue with random jitter and per-day rate-limit.
 All discovered group links pass through this queue — never joined in parallel.
 
 Key guarantees:
@@ -8,10 +8,13 @@ Key guarantees:
   - The worker loop is self-healing: if an inner error kills the consume
     loop, the outer wrapper restarts it after a short delay.
   - JoinQueueService is a singleton; HealthService can watch its worker task.
+  - Daily join limit (MAX_JOINS_PER_DAY) is enforced with an in-memory counter
+    that resets at UTC midnight. When the limit is reached, further tasks are
+    re-queued and processed the following day.
 """
 import asyncio
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +48,9 @@ class JoinQueueService:
         self._tg: Any = None
         # Track IDs already in queue to avoid duplicate requeue on reload
         self._queued_ids: set[int] = set()
+        # Daily join counter — reset every UTC midnight
+        self._daily_join_date: date = date.today()
+        self._daily_join_count: int = 0
 
     @classmethod
     def get_instance(cls) -> "JoinQueueService":
@@ -64,12 +70,21 @@ class JoinQueueService:
         await self._queue.put(task)
         logger.info("Queued join task: group_id=%d title=%r queue_size=%d", group_id, title, self._queue.qsize())
 
+    def get_daily_stats(self) -> dict:
+        """Return current-day join counter stats."""
+        return {
+            "date": self._daily_join_date.isoformat(),
+            "count": self._daily_join_count,
+            "limit": settings.MAX_JOINS_PER_DAY,
+            "remaining": max(0, settings.MAX_JOINS_PER_DAY - self._daily_join_count),
+        }
+
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
 
-        # ── Critical fix: reload any PENDING groups from DB on every startup ──
+        # ── Critical: reload any PENDING groups from DB on every startup ──────
         # The asyncio.Queue is in-memory. When the bot restarts (deploy, crash,
         # Render restart), groups with status=PENDING in the DB would otherwise
         # sit idle forever. This reload restores them to the queue automatically.
@@ -90,6 +105,35 @@ class JoinQueueService:
 
     def queue_size(self) -> int:
         return self._queue.qsize()
+
+    # ------------------------------------------------------------------
+    # Daily limit helpers
+    # ------------------------------------------------------------------
+
+    def _reset_daily_counter_if_needed(self) -> None:
+        """Reset the daily join counter when UTC date has rolled over."""
+        today = date.today()
+        if today != self._daily_join_date:
+            logger.info(
+                "New UTC day — resetting daily join counter (was %d/%d for %s)",
+                self._daily_join_count, settings.MAX_JOINS_PER_DAY,
+                self._daily_join_date.isoformat(),
+            )
+            self._daily_join_date = today
+            self._daily_join_count = 0
+
+    def _daily_limit_reached(self) -> bool:
+        self._reset_daily_counter_if_needed()
+        return self._daily_join_count >= settings.MAX_JOINS_PER_DAY
+
+    def _seconds_until_midnight_utc(self) -> float:
+        """Seconds remaining until the next UTC midnight."""
+        now = datetime.now(timezone.utc)
+        tomorrow_midnight = datetime.combine(
+            now.date() + timedelta(days=1),
+            datetime.min.time(),
+        ).replace(tzinfo=timezone.utc)
+        return (tomorrow_midnight - now).total_seconds() + 60  # +60s buffer
 
     # ------------------------------------------------------------------
     # Startup reload
@@ -184,24 +228,52 @@ class JoinQueueService:
             )
             return
 
+        # ── Daily limit check ─────────────────────────────────────────────────
+        # Check BEFORE sleeping so we don't waste the delay period on a task
+        # that will just be re-queued anyway.
+        if self._daily_limit_reached():
+            wait_secs = self._seconds_until_midnight_utc()
+            logger.warning(
+                "Daily join limit reached (%d/%d) for group_id=%d (%r) — "
+                "scheduling retry in %.0f seconds (next UTC midnight)",
+                self._daily_join_count, settings.MAX_JOINS_PER_DAY,
+                task.group_id, task.title, wait_secs,
+            )
+            # Notify admins once per limit-hit (not once per queued task)
+            await self._notify_daily_limit(task, wait_secs)
+            # Re-enqueue after midnight
+            asyncio.create_task(
+                self._requeue_after_delay(task, wait_secs),
+                name=f"daily-limit-requeue-{task.group_id}",
+            )
+            return
 
-        # Exact 7-minute delay between joins (anti-detection, configurable via env)
+        # ── Anti-detection delay: randomised jitter in [MIN, MAX] seconds ─────
         delay = random.uniform(settings.JOIN_DELAY_MIN, settings.JOIN_DELAY_MAX)
         logger.info(
-            "Waiting %.0fs (%.1f min) before joining group_id=%d (%r)",
-            delay,
-            delay / 60,
-            task.group_id,
-            task.title,
+            "Waiting %.0fs (%.1f min) before joining group_id=%d (%r)  "
+            "[daily: %d/%d]",
+            delay, delay / 60, task.group_id, task.title,
+            self._daily_join_count, settings.MAX_JOINS_PER_DAY,
         )
         await asyncio.sleep(delay)
 
+        # ── Re-check limit after sleeping (another task may have filled quota) ─
+        if self._daily_limit_reached():
+            wait_secs = self._seconds_until_midnight_utc()
+            logger.warning(
+                "Daily join limit reached after delay — re-queueing group_id=%d for midnight",
+                task.group_id,
+            )
+            asyncio.create_task(
+                self._requeue_after_delay(task, wait_secs),
+                name=f"daily-limit-requeue-post-sleep-{task.group_id}",
+            )
+            return
+
         success, real_group_id, join_error = await self._tg.join_group(task.link)
 
-        # ── Handle FloodWait: re-queue with delay instead of marking FAILED ──────
-        # join_group now returns immediately on FloodWait (no sleep inside).
-        # We parse the wait time and schedule a background re-enqueue so the
-        # group is retried after Telegram's cooling period — never marked FAILED.
+        # ── Handle FloodWait: re-queue with delay instead of marking FAILED ────
         if not success and join_error and join_error.startswith("flood_wait:"):
             try:
                 wait_secs = int(join_error.split(":")[1].rstrip("s"))
@@ -212,26 +284,19 @@ class JoinQueueService:
                 "FloodWait for group_id=%d (%r): scheduling retry in %d seconds (~%.1fh)",
                 task.group_id, task.title, wait_secs, wait_secs / 3600,
             )
-
-            async def _requeue_after_flood(t: "JoinTask", delay: int) -> None:
-                await asyncio.sleep(delay)
-                logger.info(
-                    "FloodWait expired — re-enqueuing group_id=%d (%r)",
-                    t.group_id, t.title,
-                )
-                await self.enqueue(
-                    group_id=t.group_id,
-                    link=t.link,
-                    title=t.title,
-                    attempt=t.attempt_number,
-                )
-
             asyncio.create_task(
-                _requeue_after_flood(task, wait_secs),
+                self._requeue_after_delay(task, wait_secs),
                 name=f"flood-requeue-{task.group_id}",
             )
             # Keep DB status as PENDING — group is not failed, just rate-limited
             return
+
+        # ── Increment daily counter on every actual join attempt ───────────────
+        # (regardless of success — each attempt consumes part of the daily quota)
+        self._daily_join_count += 1
+        logger.info(
+            "Daily join counter: %d/%d", self._daily_join_count, settings.MAX_JOINS_PER_DAY
+        )
 
         async with AsyncSessionLocal() as session:
             group_repo = GroupRepository(session)
@@ -248,58 +313,83 @@ class JoinQueueService:
                         await session.flush()
                         logger.info(
                             "Updated placeholder group_id %d → real group_id %d",
-                            task.group_id,
-                            real_group_id,
+                            task.group_id, real_group_id,
                         )
                     except Exception as exc:
-                        logger.warning("Could not update placeholder group_id: %s", exc)
+                        logger.warning("Could not update group_id %d → %d: %s", task.group_id, real_group_id, exc)
 
             await attempt_repo.add(
                 group_id=real_group_id or task.group_id,
-                invite_link=task.link,
                 attempt_number=task.attempt_number,
                 success=success,
-                error=join_error,
+                error_message=join_error,
             )
 
             if group:
+                group.status = GroupStatus.JOINED if success else GroupStatus.FAILED
                 if success:
-                    group.status = GroupStatus.JOINED
-                    group.join_date = datetime.now(timezone.utc)
-                    await log_repo.add(
-                        action="group_joined",
-                        result="success",
-                        target=task.link,
-                        details=(
-                            f"group_id={real_group_id or task.group_id} "
-                            f"title={task.title!r} attempt={task.attempt_number}"
-                        ),
-                    )
+                    from datetime import datetime, timezone as tz
+                    group.join_date = datetime.now(tz.utc)
+
+                await log_repo.add(
+                    action="group_joined" if success else "group_join_failed",
+                    result="success" if success else "error",
+                    target=task.link,
+                    details=(
+                        f"group_id={real_group_id or task.group_id} "
+                        f"title={task.title!r} attempt={task.attempt_number} "
+                        f"daily={self._daily_join_count}/{settings.MAX_JOINS_PER_DAY}"
+                    ),
+                )
+                if success:
                     logger.info(
                         "✅ Joined group_id=%d (%r)", real_group_id or task.group_id, task.title
                     )
                 else:
-                    group.status = GroupStatus.FAILED
-                    await log_repo.add(
-                        action="group_join_failed",
-                        result="error",
-                        target=task.link,
-                        details=(
-                            f"group_id={task.group_id} "
-                            f"title={task.title!r} attempt={task.attempt_number}"
-                        ),
-                    )
                     logger.warning(
                         "❌ Failed to join group_id=%d (%r)", task.group_id, task.title
                     )
 
             await session.commit()
 
-        # Only notify admins about FAILED joins. Successful joins are silent —
-        # the admin only wants to know about groups that have a problem.
+        # Only notify admins about FAILED joins — successful joins are silent
         if settings.get_admin_id_list() and not success:
             await self._notify_admins(task, success)
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _requeue_after_delay(self, task: JoinTask, delay: float) -> None:
+        """Sleep delay seconds then re-enqueue the task."""
+        await asyncio.sleep(delay)
+        logger.info(
+            "Re-enqueuing group_id=%d (%r) after %.0f-second delay",
+            task.group_id, task.title, delay,
+        )
+        await self.enqueue(
+            group_id=task.group_id,
+            link=task.link,
+            title=task.title,
+            attempt=task.attempt_number,
+        )
+
+    async def _notify_daily_limit(self, task: JoinTask, wait_secs: float) -> None:
+        """Notify admins that the daily join limit has been reached."""
+        try:
+            from app.services.notification_service import NotificationService
+            ns = NotificationService.get_instance()
+            hours = wait_secs / 3600
+            await ns.notify(
+                f"⏸ <b>محدودیت روزانه عضویت</b>\n\n"
+                f"سهمیه روزانه به پایان رسید: "
+                f"<code>{self._daily_join_count}/{settings.MAX_JOINS_PER_DAY}</code>\n"
+                f"گروه <code>{task.title or task.group_id}</code> در صف انتظار شب است.\n"
+                f"ادامه کار در: <b>{hours:.1f} ساعت دیگر</b> (نیمه‌شب UTC)",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     async def _notify_admins(self, task: JoinTask, success: bool) -> None:
         try:
@@ -311,7 +401,8 @@ class JoinQueueService:
                 f"{emoji} <b>عضویت {'موفق' if success else 'ناموفق'}</b>\n"
                 f"گروه: <code>{title}</code>\n"
                 f"شناسه: <code>{task.group_id}</code>\n"
-                f"تلاش: <code>{task.attempt_number}</code>",
+                f"تلاش: <code>{task.attempt_number}</code>\n"
+                f"امروز: <code>{self._daily_join_count}/{settings.MAX_JOINS_PER_DAY}</code>",
                 parse_mode="HTML",
             )
         except Exception:
