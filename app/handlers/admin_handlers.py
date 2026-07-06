@@ -4,6 +4,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import CommandStart, Command
 
 from datetime import datetime, timezone
+from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -127,9 +128,13 @@ async def cmd_queue_status(message: Message) -> None:
         attempt_repo = JoinAttemptRepository(session)
         today_count = await attempt_repo.count_today()
 
-    delay_min = 7
+    from datetime import datetime, timezone
+    delay_min = settings.JOIN_DELAY_MIN // 60
     eta_minutes = queue_size * delay_min
-    if eta_minutes >= 60:
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    if eta_minutes == 0:
+        eta_str = "صف خالی است ✅"
+    elif eta_minutes >= 60:
         eta_str = f"{eta_minutes // 60} ساعت و {eta_minutes % 60} دقیقه"
     else:
         eta_str = f"{eta_minutes} دقیقه"
@@ -137,11 +142,12 @@ async def cmd_queue_status(message: Message) -> None:
     status_icon = "⏳" if queue_size > 0 else "✅"
 
     await message.answer(
-        f"📋 <b>وضعیت صف عضویت</b>\n\n"
-        f"{status_icon} در صف: <code>{queue_size}</code> گروه\n"
+        f"📋 <b>وضعیت صف عضویت</b>\n"
+        f"⏱ بروزرسانی: <code>{now_str}</code>\n\n"
+        f"{status_icon} در صف (حافظه): <code>{queue_size}</code> گروه\n"
         f"✅ عضو شده امروز: <code>{today_count}</code> گروه\n"
-        f"⏱ زمان تخمینی تمام شدن صف: <b>{eta_str}</b>\n"
-        f"⚙️ تأخیر بین هر عضویت: <code>{delay_min} دقیقه</code>",
+        f"⏱ زمان تخمینی: <b>{eta_str}</b>\n"
+        f"⚙️ فاصله بین عضویت‌ها: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
     )
 
@@ -155,8 +161,12 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     from app.services.stats_service import StatsService
     s = await StatsService().get_stats()
 
-    delay_min = 7
-    eta_minutes = s.pending_queue_size * delay_min
+    from datetime import datetime, timezone
+    delay_min = settings.JOIN_DELAY_MIN // 60
+    queue_db = s.pending_queue_size
+    queue_mem = s.join_queue_size
+    eta_minutes = queue_db * delay_min
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     if eta_minutes == 0:
         eta_str = "صف خالی است ✅"
     elif eta_minutes >= 60:
@@ -164,7 +174,7 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     else:
         eta_str = f"{eta_minutes} دقیقه"
 
-    status_icon = "⏳" if s.pending_queue_size > 0 else "✅"
+    status_icon = "⏳" if queue_db > 0 else "✅"
 
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="queue_status")],
@@ -173,12 +183,14 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
 
     await _safe_edit(
         callback,
-        f"📋 <b>وضعیت صف عضویت</b>\n\n"
-        f"{status_icon} در صف: <code>{s.pending_queue_size}</code> گروه\n"
+        f"📋 <b>وضعیت صف عضویت</b>\n"
+        f"⏱ بروزرسانی: <code>{now_str}</code>\n\n"
+        f"{status_icon} در صف (دیتابیس): <code>{queue_db}</code> گروه\n"
+        f"{status_icon} در صف (حافظه): <code>{queue_mem}</code> گروه\n"
         f"✅ عضو شده امروز: <code>{s.today_joins}</code> گروه\n"
         f"🟢 کل عضویت‌های موفق: <code>{s.joined_groups}</code> گروه\n"
         f"⏱ زمان تخمینی: <b>{eta_str}</b>\n"
-        f"⚙️ فاصله بین هر عضویت: <code>{delay_min} دقیقه</code>",
+        f"⚙️ فاصله بین عضویت‌ها: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
         reply_markup=back_kb,
     )
@@ -220,13 +232,19 @@ async def cb_system_health(callback: CallbackQuery) -> None:
             InlineKeyboardButton(text="🛑 لغو broadcast", callback_data="cancel_broadcast_cb")
         ])
 
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    delay_min = settings.JOIN_DELAY_MIN // 60
     await _safe_edit(
         callback,
-        "❤️ <b>وضعیت سیستم</b>\n\n"
+        "❤️ <b>وضعیت سیستم</b>\n"
+        f"⏱ بروزرسانی: <code>{now_str}</code>\n\n"
         f"📡 User Client: {client_status}\n"
         f"🏥 Health Monitor: {health_status}\n"
-        f"⏱ آخرین بررسی OK: <code>{last_ok_str}</code>\n"
-        f"📋 صف عضویت: <code>{s.pending_queue_size}</code> در انتظار | ✅ امروز: <code>{s.today_joins}</code>\n"
+        f"⏱ آخرین ping OK: <code>{last_ok_str}</code>\n"
+        f"📋 صف (دیتابیس): <code>{s.pending_queue_size}</code> | صف (حافظه): <code>{jq.queue_size()}</code>\n"
+        f"✅ عضو شده امروز: <code>{s.today_joins}</code> | 🟢 کل: <code>{s.joined_groups}</code>\n"
+        f"⚙️ فاصله عضویت: <code>{delay_min} دقیقه</code>\n"
         f"📢 Broadcast: {bc_status}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
