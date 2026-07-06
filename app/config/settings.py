@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     MAX_JOINS_PER_DAY: int = 999999  # unused — daily limit removed
 
     # Join queue (anti-detection)
-    JOIN_DELAY_MIN: int = 3000
-    JOIN_DELAY_MAX: int = 3000
+    JOIN_DELAY_MIN: int = 600
+    JOIN_DELAY_MAX: int = 600
 
     # Auto-retry for failed joins
     RETRY_FAILED_JOINS: bool = True
