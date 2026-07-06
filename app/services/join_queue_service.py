@@ -300,32 +300,6 @@ class JoinQueueService:
         if settings.get_admin_id_list() and not success:
             await self._notify_admins(task, success)
 
-        # ── Forced-Subscribe detection ────────────────────────────────────
-        # After a successful join, listen briefly for bot messages that
-        # restrict the account from sending until it joins another channel.
-        if success:
-            effective_group_id = real_group_id or task.group_id
-            asyncio.create_task(
-                self._check_forced_subscribe(effective_group_id, task.title),
-                name=f"forced-subscribe-check-{effective_group_id}",
-            )
-
-    async def _check_forced_subscribe(
-        self, group_id: int, group_title: str | None
-    ) -> None:
-        try:
-            from app.services.forced_subscribe_service import ForcedSubscribeService
-            fs = ForcedSubscribeService.get_instance()
-            auto_joined = await fs.check_after_join(group_id, group_title)
-            if auto_joined:
-                logger.info(
-                    "ForcedSubscribe: auto-joined %d target(s) for group %d (%r): %s",
-                    len(auto_joined), group_id, group_title, auto_joined,
-                )
-        except Exception as exc:
-            logger.error(
-                "ForcedSubscribe check failed for group %d: %s", group_id, exc
-            )
 
     async def _notify_admins(self, task: JoinTask, success: bool) -> None:
         try:
