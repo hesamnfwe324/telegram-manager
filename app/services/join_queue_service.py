@@ -267,14 +267,17 @@ class JoinQueueService:
             )
             return
 
-        # ── Account restriction / soft-ban guard ──────────────────────────────
-        # If the queue is paused (HealthService detected soft-ban) OR the
-        # Telethon client is not running, re-queue with a delay so groups stay
-        # PENDING and daily quota is not consumed.
-        if self.is_paused() or not self._tg.is_running():
-            import asyncio as _asyncio
-            reason = "queue paused (soft-ban)" if self.is_paused() else "user client offline"
-            retry_delay = max(self._pause_until - _asyncio.get_event_loop().time(), 60.0) if self.is_paused() else 300.0
+        # ── Account restriction / soft-ban guard (pre-sleep check) ──────────────
+        # Cache is_paused() once to avoid race around expiry boundary during check.
+        # If paused or client offline, re-queue immediately — groups stay PENDING.
+        paused_now = self.is_paused()
+        client_online = self._tg.is_running()
+        if paused_now or not client_online:
+            reason = "queue paused (soft-ban)" if paused_now else "user client offline"
+            retry_delay = (
+                max(self._pause_until - asyncio.get_event_loop().time(), 60.0)
+                if paused_now else 300.0
+            )
             logger.warning(
                 "Cannot join group_id=%d (%r): %s — re-queuing in %.0fs",
                 task.group_id, task.title, reason, retry_delay,
@@ -325,6 +328,26 @@ class JoinQueueService:
             asyncio.create_task(
                 self._requeue_after_delay(task, wait_secs),
                 name=f"daily-limit-requeue-post-sleep-{task.group_id}",
+            )
+            return
+
+        # ── Post-sleep account restriction guard ──────────────────────────────
+        # Client may have dropped or been restricted during the jitter sleep.
+        # Re-check before making the actual Telegram API call so we don't
+        # increment the daily counter or mark groups FAILED on an offline client.
+        if self.is_paused() or not self._tg.is_running():
+            reason = "queue paused (soft-ban)" if self.is_paused() else "user client offline"
+            retry_delay = (
+                max(self._pause_until - asyncio.get_event_loop().time(), 60.0)
+                if self.is_paused() else 300.0
+            )
+            logger.warning(
+                "Post-sleep restriction for group_id=%d (%r): %s — re-queuing in %.0fs",
+                task.group_id, task.title, reason, retry_delay,
+            )
+            asyncio.create_task(
+                self._requeue_after_delay(task, retry_delay),
+                name=f"post-sleep-restriction-requeue-{task.group_id}",
             )
             return
 
