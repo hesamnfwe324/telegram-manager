@@ -299,6 +299,16 @@ class TelegramUserService:
                 link, exc.seconds, exc.seconds / 3600,
             )
             return False, None, f"flood_wait:{exc.seconds}s"
+        except PeerFloodError:
+            # Account is temporarily restricted by Telegram (soft-ban / anti-spam).
+            # Return a dedicated sentinel so callers re-queue WITHOUT marking FAILED
+            # and WITHOUT burning the daily join counter.
+            logger.warning(
+                "PeerFlood joining %s — account temporarily restricted. "
+                "Returning peer_flood so caller re-queues without FAILED status.",
+                link,
+            )
+            return False, None, "peer_flood"
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             logger.error("Failed to join %s: %s", link, err)

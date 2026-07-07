@@ -51,6 +51,11 @@ class JoinQueueService:
         # Daily join counter — reset every UTC midnight
         self._daily_join_date: date = date.today()
         self._daily_join_count: int = 0
+        # Pause flag: set by HealthService when a soft-ban / account restriction is detected.
+        # While paused, _process re-queues tasks instead of attempting joins,
+        # so groups stay PENDING and the daily counter is not burned.
+        self._paused: bool = False
+        self._pause_until: float = 0.0  # asyncio monotonic time
 
     @classmethod
     def get_instance(cls) -> "JoinQueueService":
@@ -78,6 +83,40 @@ class JoinQueueService:
             "limit": settings.MAX_JOINS_PER_DAY,
             "remaining": max(0, settings.MAX_JOINS_PER_DAY - self._daily_join_count),
         }
+
+    def pause(self, seconds: float = 3600.0) -> None:
+        """Pause the join queue for *seconds* seconds.
+
+        Called by HealthService when a soft-ban / consecutive failures are detected.
+        While paused, _process re-queues every task without attempting a join,
+        so groups stay PENDING and the daily counter is not wasted.
+        """
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        self._paused = True
+        self._pause_until = loop.time() + seconds
+        logger.warning(
+            "Join queue PAUSED for %.0f seconds (%.1f hours) due to account restriction",
+            seconds, seconds / 3600,
+        )
+
+    def resume(self) -> None:
+        """Manually resume a paused queue before the timer expires."""
+        self._paused = False
+        self._pause_until = 0.0
+        logger.info("Join queue RESUMED manually")
+
+    def is_paused(self) -> bool:
+        import asyncio as _asyncio
+        if not self._paused:
+            return False
+        loop = _asyncio.get_event_loop()
+        if loop.time() >= self._pause_until:
+            self._paused = False
+            self._pause_until = 0.0
+            logger.info("Join queue pause expired — resuming automatically")
+            return False
+        return True
 
     async def start(self) -> None:
         if self._running:
@@ -228,6 +267,24 @@ class JoinQueueService:
             )
             return
 
+        # ── Account restriction / soft-ban guard ──────────────────────────────
+        # If the queue is paused (HealthService detected soft-ban) OR the
+        # Telethon client is not running, re-queue with a delay so groups stay
+        # PENDING and daily quota is not consumed.
+        if self.is_paused() or not self._tg.is_running():
+            import asyncio as _asyncio
+            reason = "queue paused (soft-ban)" if self.is_paused() else "user client offline"
+            retry_delay = max(self._pause_until - _asyncio.get_event_loop().time(), 60.0) if self.is_paused() else 300.0
+            logger.warning(
+                "Cannot join group_id=%d (%r): %s — re-queuing in %.0fs",
+                task.group_id, task.title, reason, retry_delay,
+            )
+            asyncio.create_task(
+                self._requeue_after_delay(task, retry_delay),
+                name=f"restriction-requeue-{task.group_id}",
+            )
+            return
+
         # ── Daily limit check ─────────────────────────────────────────────────
         # Check BEFORE sleeping so we don't waste the delay period on a task
         # that will just be re-queued anyway.
@@ -289,6 +346,36 @@ class JoinQueueService:
                 name=f"flood-requeue-{task.group_id}",
             )
             # Keep DB status as PENDING — group is not failed, just rate-limited
+            return
+
+        # ── Handle PeerFlood / soft-ban: pause queue + re-queue without FAILED ─
+        # PeerFlood means Telegram temporarily restricted the account.
+        # Do NOT mark group FAILED or burn the daily counter —
+        # pause the whole queue for 2 hours and re-queue as PENDING.
+        if not success and join_error == "peer_flood":
+            pause_secs = 7200.0  # 2 hours
+            logger.warning(
+                "PeerFlood for group_id=%d (%r): pausing queue for %.0fs and re-queuing",
+                task.group_id, task.title, pause_secs,
+            )
+            self.pause(pause_secs)
+            asyncio.create_task(
+                self._requeue_after_delay(task, pause_secs + 120),
+                name=f"peer-flood-requeue-{task.group_id}",
+            )
+            try:
+                from app.services.notification_service import NotificationService
+                ns = NotificationService.get_instance()
+                await ns.notify_critical(
+                    "🚫 PeerFlood — صف متوقف شد",
+                    f"حساب کاربری موقتاً توسط تلگرام محدود شد (PeerFlood).\n"
+                    f"صف عضویت برای <b>2 ساعت</b> متوقف شد.\n"
+                    f"گروه فعلی: <code>{task.title or task.group_id}</code>\n"
+                    f"وضعیت: <b>PENDING</b> (تلاش مجدد بعد از رفع محدودیت)",
+                )
+            except Exception:
+                pass
+            # Keep DB status as PENDING — not a permanent failure
             return
 
         # ── Increment daily counter on every actual join attempt ───────────────

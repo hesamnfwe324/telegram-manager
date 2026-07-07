@@ -180,6 +180,18 @@ class HealthService:
             pass
 
     async def _alert(self, error: str) -> None:
+        # ── Pause join queue to protect daily quota while account is restricted ─
+        try:
+            if self._jq is not None:
+                pause_secs = 3600.0  # 1 hour — give Telegram time to lift restriction
+                self._jq.pause(pause_secs)
+                logger.warning(
+                    "Soft-ban detected — join queue paused for %.0fs to protect daily quota",
+                    pause_secs,
+                )
+        except Exception as exc:
+            logger.warning("Could not pause join queue on soft-ban alert: %s", exc)
+
         try:
             from app.services.notification_service import NotificationService
             ns = NotificationService.get_instance()
@@ -188,7 +200,8 @@ class HealthService:
                 f"تعداد خطاهای متوالی: <code>{self._consecutive_failures}</code>\n"
                 f"خطا: <code>{error[:200]}</code>\n\n"
                 "ربات ممکن است soft-ban شده باشد یا session منقضی شده.\n"
-                "در حال تلاش برای reconnect خودکار …",
+                "در حال تلاش برای reconnect خودکار …\n\n"
+                "⏸ <b>صف عضویت 1 ساعت متوقف شد</b> تا quota روزانه حفظ شود.",
             )
         except Exception:
             pass
