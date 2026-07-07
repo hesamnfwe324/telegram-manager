@@ -369,7 +369,7 @@ class BroadcastQueueService:
             done_count = idx + 1
             if done_count % PROGRESS_EVERY == 0 and done_count < job.total:
                 await self._send_progress(job, done_count)
-                        await asyncio.sleep(settings.TG_DM_DELAY_SECONDS)
+            await asyncio.sleep(settings.TG_DM_DELAY_SECONDS)
 
     async def _send_to_groups(self, job: BroadcastJob) -> None:
         from app.services.telegram_service import TelegramUserService
@@ -424,6 +424,7 @@ class BroadcastQueueService:
         except Exception as exc:
             logger.warning("Could not send initial progress message: %s", exc)
 
+        peer_flood_count_g = 0
         for idx, group in enumerate(target_groups):
             group_id = group["group_id"]
             group_link = group.get("invite_link") or (
@@ -448,10 +449,29 @@ class BroadcastQueueService:
                 if job.first_group_error is None:
                     job.first_group_error = f"gid={group_id}: {reason}"
                 if reason == "peer_flood":
-                    job.error = "پیر فلاد: اکانت موقتاً محدود شد. broadcast متوقف شد."
-                    logger.error("Broadcast job %s stopped due to PeerFloodError", job.job_id)
+                    peer_flood_count_g += 1
+                    logger.warning(
+                        "PeerFlood #%d on group %d in broadcast %s — pausing %ds",
+                        peer_flood_count_g, group_id, job.job_id, settings.PEER_FLOOD_PAUSE_SECONDS,
+                    )
                     await self._log("broadcast_group_failed", "error", actor, str(group_id), reason)
-                    return
+                    if peer_flood_count_g >= settings.MAX_PEER_FLOOD_PAUSES:
+                        job.error = f"PeerFlood {peer_flood_count_g}x گروهی: broadcast متوقف شد."
+                        logger.error(
+                            "Broadcast %s aborted after %d group PeerFlood errors",
+                            job.job_id, peer_flood_count_g,
+                        )
+                        return
+                    try:
+                        await job.bot.send_message(
+                            job.actor_id,
+                            f"⚠️ <b>PeerFlood گروهی #{peer_flood_count_g}</b>\n"
+                            f"{settings.PEER_FLOOD_PAUSE_SECONDS // 60} دقیقه صبر می‌کنم...",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(settings.PEER_FLOOD_PAUSE_SECONDS)
                 elif reason and reason.startswith("flood_wait:"):
                     try:
                         wait_secs = int(reason.split(":")[1].rstrip("s"))
