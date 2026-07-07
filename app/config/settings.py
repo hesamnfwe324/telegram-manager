@@ -12,12 +12,15 @@ class Settings(BaseSettings):
     )
 
     # ── Telegram User Client (Telethon) ────────────────────────────────────────
-    # IMPORTANT: DO NOT use default/shared API credentials such as
-    # API_ID=2040 / API_HASH="b18441a1ff607e10a989891a5462e627" (Telegram Desktop).
+    # IMPORTANT: DO NOT use shared credentials such as API_ID=2040 (Telegram Desktop).
     # Using shared credentials causes account bans. Register your own app at:
     # https://my.telegram.org/apps and supply the values via environment variables.
-    TELEGRAM_API_ID: int          # Required — no default; must be set in env
-    TELEGRAM_API_HASH: str        # Required — no default; must be set in env
+    #
+    # Defaults are 0/"" so the bot can start without crashing even when these are
+    # not yet set in the deployment environment. The Telethon user-client will
+    # refuse to connect and log a clear warning until real values are provided.
+    TELEGRAM_API_ID: int = 0      # Set via TELEGRAM_API_ID env var
+    TELEGRAM_API_HASH: str = ""   # Set via TELEGRAM_API_HASH env var
     TELEGRAM_PHONE: str = ""
     TELEGRAM_SESSION_NAME: str = "tg_session"
     TELEGRAM_SESSION_STRING: str = ""

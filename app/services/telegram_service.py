@@ -106,10 +106,14 @@ class TelegramUserService:
             if settings.TELEGRAM_SESSION_STRING
             else StringSession()
         )
+        # Use placeholder values when credentials are not configured.
+        # The client will not be started (start() checks credentials first).
+        api_id = settings.TELEGRAM_API_ID or 1
+        api_hash = settings.TELEGRAM_API_HASH or "0" * 32
         self.client = TelegramClient(
             session,
-            settings.TELEGRAM_API_ID,
-            settings.TELEGRAM_API_HASH,
+            api_id,
+            api_hash,
             connection_retries=10,
             retry_delay=5,
             auto_reconnect=True,
@@ -145,7 +149,21 @@ class TelegramUserService:
             cls._instance = cls()
         return cls._instance
 
+    def _has_valid_credentials(self) -> bool:
+        """Return True only when real (non-placeholder) API credentials are set."""
+        return bool(settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
+
     async def start(self) -> None:
+        if not self._has_valid_credentials():
+            logger.error(
+                "TELEGRAM_API_ID / TELEGRAM_API_HASH are not configured. "
+                "Register your own app at https://my.telegram.org/apps and set "
+                "these environment variables in Render. "
+                "The Telethon user client will NOT start until they are provided."
+            )
+            # Do NOT raise — let the bot (aiogram) keep running normally.
+            # Only Telethon-backed features (join, broadcast via user account) are disabled.
+            return
         await self.client.connect()
         if not await self.client.is_user_authorized():
             logger.warning("Telegram session not authorized — interactive login required")
