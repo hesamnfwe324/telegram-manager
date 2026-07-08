@@ -54,6 +54,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📋 وضعیت صف عضویت", callback_data="queue_status"),
             InlineKeyboardButton(text="⚙️ فاصله عضویت", callback_data="join_delay_menu"),
         ],
+        [InlineKeyboardButton(text="🆕 ۲ گروه اخیر", callback_data="recent_groups")],
         [InlineKeyboardButton(text="🔄 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
             InlineKeyboardButton(text="👥 همگام‌سازی مخاطبین", callback_data="sync_users")],
     ])
@@ -207,6 +208,98 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
         f"⚙️ فاصله بین عضویت‌ها: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
         reply_markup=back_kb,
+    )
+
+
+def _recent_groups_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="recent_groups")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
+    ])
+
+
+@router.callback_query(F.data == "recent_groups")
+async def cb_recent_groups(callback: CallbackQuery) -> None:
+    """۲ گروهی که اخیراً عضو شده‌ایم، همراه با آمار دقیق و لحظه‌ای (زنده از تلگرام)."""
+    await callback.answer()
+
+    import asyncio
+    from html import escape as _esc
+
+    from app.database.connection import AsyncSessionLocal
+    from app.repositories.group_repository import GroupRepository
+    from app.services import TelegramUserService
+
+    async with AsyncSessionLocal() as session:
+        group_repo = GroupRepository(session)
+        recent = await group_repo.get_recently_joined(limit=2)
+
+    if not recent:
+        await _safe_edit(
+            callback,
+            "🆕 <b>۲ گروه اخیر</b>\n\nهنوز هیچ گروهی با موفقیت عضو نشده است.",
+            parse_mode="HTML",
+            reply_markup=_recent_groups_keyboard(),
+        )
+        return
+
+    tg = TelegramUserService.get_instance()
+    live_ok = tg.is_running()
+
+    lines: list[str] = ["🆕 <b>۲ گروه اخیر که عضو شده‌ایم</b>"]
+    for group in recent:
+        # Escape group-supplied text (title/username) before embedding in HTML —
+        # Telegram titles can legally contain <, >, & which would otherwise
+        # break Telegram's HTML entity parser and make this message fail to send.
+        title = _esc(group.title) if group.title else str(group.group_id)
+        members_count = group.members_count
+        live_tag = "⚠️ آمار ذخیره‌شده (اتصال زنده برقرار نیست)"
+
+        if live_ok:
+            try:
+                # Bound the live Telethon round-trip so a slow/stalled API call
+                # can't hang this callback indefinitely — falls back to the
+                # last known DB value instead of blocking the admin's tap.
+                async def _fetch_live() -> int | None:
+                    entity = await tg.client.get_entity(group.group_id)
+                    _, _, _, count = await tg.get_entity_info(entity)
+                    return count
+
+                fresh_count = await asyncio.wait_for(_fetch_live(), timeout=8)
+                if fresh_count is not None:
+                    members_count = fresh_count
+                    live_tag = "🟢 آمار لحظه‌ای از تلگرام"
+                else:
+                    live_tag = "⚠️ آمار ذخیره‌شده (تلگرام تعداد اعضا را برنگرداند)"
+            except asyncio.TimeoutError:
+                logger.debug("Live member-count fetch timed out for group %d", group.group_id)
+                live_tag = "⚠️ آمار ذخیره‌شده (دریافت زنده کند بود)"
+            except Exception as exc:
+                logger.debug("Live member-count fetch failed for group %d: %s", group.group_id, exc)
+                live_tag = "⚠️ آمار ذخیره‌شده (خطا در دریافت زنده)"
+
+        join_date_str = (
+            group.join_date.strftime("%Y-%m-%d %H:%M UTC") if group.join_date else "نامشخص"
+        )
+        members_str = f"{members_count:,}" if members_count is not None else "نامشخص"
+        lines.append(f"\n📌 <b>{title}</b>")
+        lines.append(f"👥 اعضا: <code>{members_str}</code>")
+        lines.append(f"🕓 زمان عضویت: <code>{join_date_str}</code>")
+        lines.append(live_tag)
+        if group.username:
+            lines.append(f"🔗 @{_esc(group.username)}")
+
+    if not live_ok:
+        lines.append(
+            "\n⚠️ برای دریافت آمار کاملاً لحظه‌ای، سیستم باید روشن باشد "
+            "(دکمه «▶️ شروع سیستم»)."
+        )
+
+    await _safe_edit(
+        callback,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=_recent_groups_keyboard(),
     )
 
 

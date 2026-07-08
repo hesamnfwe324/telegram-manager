@@ -69,6 +69,22 @@ class GroupRepository(BaseRepository[Group]):
     async def get_joined(self) -> list[Group]:
         return await self.get_by_status(GroupStatus.JOINED, limit=5000)
 
+    async def get_recently_joined(self, limit: int = 2) -> list[Group]:
+        """Groups with status=JOINED, most recent join first.
+
+        Orders by join_date (the actual moment we joined) rather than
+        created_at, falling back to created_at for any legacy rows where
+        join_date was never recorded.
+        """
+        order_col = func.coalesce(Group.join_date, Group.created_at)
+        result = await self._session.execute(
+            select(Group)
+            .where(Group.status == GroupStatus.JOINED)
+            .order_by(order_col.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def get_all(self, limit: int = 100000, offset: int = 0) -> list[Group]:
         result = await self._session.execute(
             select(Group).order_by(Group.created_at.desc()).limit(limit).offset(offset)
