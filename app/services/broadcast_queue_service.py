@@ -26,6 +26,7 @@ from aiogram.exceptions import (
 from app.config import settings
 from app.database.connection import AsyncSessionLocal
 from app.repositories import GroupRepository, ContactedUserRepository, LogRepository
+from app.models.group import GroupStatus
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,6 +39,31 @@ PER_CALL_TIMEOUT = 60 # max seconds for a single Telethon call (prevents FloodWa
 PROGRESS_EVERY = 25   # edit progress message every N users
 
 _MAX_BROADCAST_SECONDS: int = 3600
+
+# Failure reasons that mean the account is no longer a usable member of the
+# group (kicked, banned, left, chat deleted, etc). When a broadcast hits one
+# of these, the group is stale in the DB and will just keep failing on every
+# future broadcast until someone manually re-syncs — so we mark it LEFT
+# immediately instead of waiting for a manual sync.
+_GROUP_UNREACHABLE_MARKERS = (
+    "banned",
+    "no_write_permission",
+    "chat not found",
+    "entity_not_found",
+    "channel_private",
+    "not a participant",
+    "usernotparticipant",
+    "chat_id_invalid",
+    "peer_id_invalid",
+    "kicked",
+)
+
+
+def _is_group_unreachable(reason: str | None) -> bool:
+    if not reason:
+        return False
+    r = reason.lower()
+    return any(marker in r for marker in _GROUP_UNREACHABLE_MARKERS)
 
 
 @dataclass
@@ -448,6 +474,8 @@ class BroadcastQueueService:
                 job.failed += 1
                 if job.first_group_error is None:
                     job.first_group_error = f"gid={group_id}: {reason}"
+                if _is_group_unreachable(reason):
+                    await self._mark_group_left(group_id, reason)
                 if reason == "peer_flood":
                     peer_flood_count_g += 1
                     logger.warning(
@@ -512,6 +540,25 @@ class BroadcastQueueService:
                 job.progress_message_id = msg.message_id
         except Exception:
             pass
+    async def _mark_group_left(self, group_id: int, reason: str | None) -> None:
+        """Mark a group LEFT the moment a broadcast proves the account can no
+        longer reach it (banned/kicked/left/deleted). Without this, the group
+        stays JOINED in the DB and every future broadcast wastes an attempt
+        on it until someone manually re-syncs dialogs."""
+        try:
+            async with AsyncSessionLocal() as s:
+                repo = GroupRepository(s)
+                group = await repo.get_by_group_id(group_id)
+                if group and group.status != GroupStatus.LEFT:
+                    group.status = GroupStatus.LEFT
+                    await s.commit()
+                    logger.info(
+                        "Marked group %d as LEFT after broadcast failure (%s)",
+                        group_id, reason,
+                    )
+        except Exception as exc:
+            logger.warning("Failed to mark group %d as left: %s", group_id, exc)
+
     async def _mark_user_blocked(self, user_id: int) -> None:
         try:
             async with AsyncSessionLocal() as s:

@@ -64,6 +64,17 @@ class SchedulerService:
             misfire_grace_time=3600,
         )
 
+        # Auto-sync live Telethon dialogs into the DB every 3 hours, so groups
+        # the account was kicked/banned from (or newly joined via other means)
+        # don't sit stale as JOINED and keep wasting broadcast attempts.
+        self._scheduler.add_job(
+            self._auto_sync_dialogs,
+            IntervalTrigger(hours=3),
+            id="auto_sync_dialogs",
+            replace_existing=True,
+            misfire_grace_time=600,
+        )
+
         # Reload missed PENDING/APPROVED groups every 9 minutes.
         # The join queue processes one group per ~9 min naturally, but if a group
         # was added to the DB while the queue was draining (e.g. during discovery),
@@ -156,6 +167,24 @@ class SchedulerService:
             )
         except Exception as exc:
             logger.warning("Periodic pending-reload failed: %s", exc)
+
+    async def _auto_sync_dialogs(self) -> None:
+        """Periodically re-sync live Telethon dialogs into the DB, marking any
+        group the account is no longer a member of as LEFT. Runs alongside the
+        per-broadcast LEFT-marking in BroadcastQueueService as a safety net
+        (e.g. for accounts kicked while no broadcast is running)."""
+        try:
+            from app.services.telegram_service import TelegramUserService
+            tg = TelegramUserService.get_instance()
+            if not tg.is_running():
+                return
+            new_count, total = await tg.sync_dialogs_to_db()
+            logger.info(
+                "Auto dialog sync complete: %d total live groups, %d newly added",
+                total, new_count,
+            )
+        except Exception as exc:
+            logger.warning("Auto dialog sync failed: %s", exc)
 
     async def _daily_stats_report(self) -> None:
         try:
