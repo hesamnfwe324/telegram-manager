@@ -168,7 +168,7 @@ class JoinQueueService:
 
     def _daily_limit_reached(self) -> bool:
         self._reset_daily_counter_if_needed()
-        return self._daily_join_count >= settings.MAX_JOINS_PER_DAY
+        return False  # محدودیت روزانه غیرفعال است
 
     def _seconds_until_midnight_utc(self) -> float:
         """Seconds remaining until the next UTC midnight."""
