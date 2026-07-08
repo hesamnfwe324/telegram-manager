@@ -471,7 +471,7 @@ async def cb_system_health(callback: CallbackQuery) -> None:
         f"⏱ آخرین ping OK: <code>{last_ok_str}</code>\n"
         f"📋 صف (دیتابیس): <code>{s.pending_queue_size}</code> | صف (حافظه): <code>{jq.queue_size()}</code>\n"
         f"✅ عضو شده امروز: <code>{s.today_joins}</code> | 🟢 کل: <code>{s.joined_groups}</code>\n"
-        f"🔒 بسته/محدود برای ارسال: <code>{s.write_restricted_groups}</code>\n"
+        f"🔒 در انتظار خروج (بن ارسال): <code>{s.write_restricted_groups}</code>\n"
         f"⚙️ فاصله عضویت: <code>{delay_min} دقیقه</code>\n"
         f"📢 Broadcast: {bc_status}",
         parse_mode="HTML",
@@ -616,7 +616,10 @@ async def cb_instant_cleanup(callback: CallbackQuery) -> None:
                 f"✅ <b>پاکسازی آنی کامل شد</b>\n\n"
                 f"📦 گروه‌های زنده فعلی: <code>{total}</code>\n"
                 f"🆕 جدید ثبت‌شده: <code>{new_count}</code>\n"
-                f"🧹 گروه‌هایی که دیگر عضوشان نبودیم، به وضعیت «ترک‌شده» منتقل شدند."
+                f"🧹 گروه‌هایی که دیگر عضوشان نبودیم، به وضعیت «ترک‌شده» منتقل شدند.\n\n"
+                f"ℹ️ گروه‌هایی که ارسال پیام در آن‌ها بسته/بن شده باشد، به‌صورت "
+                f"خودکار حین ارسال همگانی شناسایی و از آن‌ها خارج می‌شویم — "
+                f"نیازی به عملیات جدا نیست."
             )
     except Exception as exc:
         text = f"❌ <b>خطا در پاکسازی:</b>\n<code>{str(exc)[:300]}</code>"

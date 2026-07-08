@@ -40,15 +40,16 @@ PROGRESS_EVERY = 25   # edit progress message every N users
 
 _MAX_BROADCAST_SECONDS: int = 3600
 
-# Failure reasons that mean the account can no longer post there because it
-# has been banned/restricted from *writing*, but may still technically be a
-# member (still shows up in live dialogs). These get can_write=False instead
-# of status=LEFT, because the periodic dialog sync re-marks every live
-# dialog as JOINED and would otherwise silently undo a LEFT here.
+# Failure reasons that mean the account can never post there again: either
+# an admin permanently banned it from sending (UserBannedInChannelError), or
+# writing is globally forbidden for it in that chat (ChatWriteForbiddenError /
+# ChatAdminRequiredError). Matched against the canonical reason prefixes set
+# by TelegramUserService.forward_message_to_group's typed exception handlers
+# — not a loose substring guess — so detection doesn't depend on Telegram's
+# (locale-dependent) client-facing error text.
 _GROUP_WRITE_RESTRICTED_MARKERS = (
-    "banned",
-    "no_write_permission",
-    "restricted",
+    "user_banned_in_channel",
+    "chat_write_forbidden",
 )
 
 # Failure reasons that mean the group/chat itself is gone or the account was
@@ -504,7 +505,9 @@ class BroadcastQueueService:
                 if job.first_group_error is None:
                     job.first_group_error = f"gid={group_id}: {reason}"
                 if _is_write_restricted(reason):
-                    await self._mark_group_write_restricted(group_id, reason)
+                    await self._leave_write_restricted_group(group_id, group.get("invite_link") or (
+                        f"@{group['username']}" if group.get("username") else None
+                    ), reason)
                 elif _is_group_unreachable(reason):
                     await self._mark_group_left(group_id, reason)
                 if reason == "peer_flood":
@@ -607,6 +610,43 @@ class BroadcastQueueService:
                     )
         except Exception as exc:
             logger.warning("Failed to mark group %d write-restricted: %s", group_id, exc)
+
+    async def _leave_write_restricted_group(self, group_id: int, group_link: str | None, reason: str | None) -> None:
+        """A group where the account is permanently banned/forbidden from
+        sending is dead weight — there's no reason to stay a silent member.
+
+        Actually leaves via Telethon (real Telegram-level exit, not just a
+        DB flag), then marks the group LEFT in the DB either way so it never
+        gets targeted again — even if the live leave call fails (e.g.
+        transient network error), the DB record already reflects the
+        decision and the periodic dialog sync will reconcile the rest.
+        """
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        left_live = False
+        try:
+            left_live = await tg.leave_group_by_id(group_id, group_link)
+        except Exception as exc:
+            logger.warning("Error while trying to leave group %d live: %s", group_id, exc)
+
+        await self._mark_group_left(group_id, reason)
+        # can_write=False is also recorded for audit/history even though the
+        # group moves to LEFT — harmless if the leave call is later retried.
+        try:
+            async with AsyncSessionLocal() as s:
+                repo = GroupRepository(s)
+                await repo.mark_write_restricted(group_id)
+                await s.commit()
+        except Exception:
+            pass
+
+        if left_live:
+            logger.info("Left write-restricted group %d live via Telethon (%s)", group_id, reason)
+        else:
+            logger.warning(
+                "Could not confirm live leave for write-restricted group %d — marked LEFT in DB only (%s)",
+                group_id, reason,
+            )
 
     async def _mark_user_blocked(self, user_id: int) -> None:
         try:

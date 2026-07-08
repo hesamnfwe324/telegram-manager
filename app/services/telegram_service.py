@@ -16,6 +16,7 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     ChannelPrivateError,
     ChatAdminRequiredError,
+    UserBannedInChannelError,
 )
 
 from app.config import settings
@@ -526,10 +527,17 @@ class TelegramUserService:
 
             return False, "no_sendable_content"
 
+        except UserBannedInChannelError as exc:
+            # Admin-level ban from sending in this specific group/channel.
+            # The account is still a member — just permanently muted here.
+            logger.warning("UserBannedInChannelError in group %d — account is banned from posting", group_id)
+            return False, f"user_banned_in_channel: {exc}"
         except (ChatWriteForbiddenError, ChatAdminRequiredError) as exc:
-            # Forced-subscribe disabled — just log and return
+            # Writing is forbidden in this chat (either this account's own
+            # write rights were revoked, or the group disabled messaging for
+            # non-admins entirely). Either way, we can never post here.
             logger.warning("ChatWriteForbiddenError in group %d — skipping (forced-subscribe disabled)", group_id)
-            return False, f"no_write_permission: {exc}"
+            return False, f"chat_write_forbidden: {exc}"
         except FloodWaitError as exc:
             logger.warning(
                 "FloodWait sending to group %d: wait %d seconds (~%.1fh)",
@@ -822,6 +830,32 @@ class TelegramUserService:
             len(all_groups), new_count, left_count,
         )
         return new_count, len(all_groups)
+
+    async def leave_group_by_id(self, group_id: int, group_link: str | None = None) -> bool:
+        """Actually leave a group/channel via Telethon — not just a DB flag.
+
+        Used for groups where the account has been banned/restricted from
+        sending (UserBannedInChannelError / ChatWriteForbiddenError): there
+        is no value in staying a silent, permanently-muted member, so we
+        exit for real instead of just excluding it from future broadcasts.
+        `delete_dialog` picks the correct RPC (leave channel vs. delete
+        small-group membership) based on the entity type.
+        """
+        try:
+            entity = None
+            if group_link:
+                try:
+                    entity = await self.client.get_entity(group_link)
+                except Exception:
+                    entity = None
+            if entity is None:
+                entity = await self.client.get_entity(group_id)
+            await asyncio.wait_for(self.client.delete_dialog(entity), timeout=30.0)
+            logger.info("Left group %d via Telethon (write-restricted cleanup)", group_id)
+            return True
+        except Exception as exc:
+            logger.warning("leave_group_by_id: could not leave group %d live: %s", group_id, exc)
+            return False
 
     async def get_all_user_dialogs(self, limit: int = 3000) -> list[dict]:
         """Return all private (one-on-one) chat users from the personal Telethon account.
