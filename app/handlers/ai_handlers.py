@@ -30,7 +30,6 @@
       user_name = message.from_user.first_name or ""
       clear_history(user_id)
 
-      # Grok opens the conversation naturally
       reply = await chat(user_id, "/start", user_name=user_name)
       if reply:
           await message.answer(reply)
@@ -45,7 +44,7 @@
       if not message.from_user:
           return
       if _is_admin(message.from_user.id):
-          return  # admins use the admin panel
+          return
 
       text = (message.text or message.caption or "").strip()
       if not text:

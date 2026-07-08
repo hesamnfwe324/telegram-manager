@@ -12,15 +12,8 @@
       )
 
       # ── Telegram User Client (Telethon) ────────────────────────────────────────
-      # IMPORTANT: DO NOT use shared credentials such as API_ID=2040 (Telegram Desktop).
-      # Using shared credentials causes account bans. Register your own app at:
-      # https://my.telegram.org/apps and supply the values via environment variables.
-      #
-      # Defaults are 0/"" so the bot can start without crashing even when these are
-      # not yet set in the deployment environment. The Telethon user-client will
-      # refuse to connect and log a clear warning until real values are provided.
-      TELEGRAM_API_ID: int = 0      # Set via TELEGRAM_API_ID env var
-      TELEGRAM_API_HASH: str = ""   # Set via TELEGRAM_API_HASH env var
+      TELEGRAM_API_ID: int = 0
+      TELEGRAM_API_HASH: str = ""
       TELEGRAM_PHONE: str = ""
       TELEGRAM_SESSION_NAME: str = "tg_session"
       TELEGRAM_SESSION_STRING: str = ""
@@ -34,7 +27,7 @@
       # ── Database ───────────────────────────────────────────────────────────────
       DATABASE_URL: str
 
-      # ── Redis (FSM + task queue — optional but strongly recommended for prod) ──
+      # ── Redis ──────────────────────────────────────────────────────────────────
       REDIS_URL: str = ""
 
       # ── App ────────────────────────────────────────────────────────────────────
@@ -65,8 +58,8 @@
       MAX_JOINS_PER_DAY: int = 30
 
       # ── Join queue anti-detection delays ───────────────────────────────────────
-      JOIN_DELAY_MIN: int = 3600   # seconds — 1 hour
-      JOIN_DELAY_MAX: int = 4500   # seconds — 1 hour 15 minutes
+      JOIN_DELAY_MIN: int = 3600
+      JOIN_DELAY_MAX: int = 4500
 
       # ── Auto-retry for failed joins ────────────────────────────────────────────
       RETRY_FAILED_JOINS: bool = True
@@ -81,11 +74,8 @@
       TG_DM_DELAY_SECONDS: float = 5.0
 
       # ── Grok AI (xAI) — conversational DM assistant ────────────────────────────
-      # API key from https://console.x.ai/
       GROK_API_KEY: str = ""
-      # Link to your Telegram channel — shared naturally during AI conversation
       CHANNEL_INVITE_LINK: str = "https://t.me/addlist/4xJXMUc98LZhNGM8"
-      # Link to your Telegram bot — shared naturally during AI conversation
       BOT_LINK: str = "https://t.me/AmazonGiftCardBot?start=REF6538Q62Z"
 
       @field_validator("JOIN_DELAY_MAX", mode="after")
@@ -95,8 +85,7 @@
               min_val = getattr(info, "data", {}).get("JOIN_DELAY_MIN", 0)
               if min_val and v < min_val:
                   raise ValueError(
-                      f"JOIN_DELAY_MAX ({v}) must be >= JOIN_DELAY_MIN ({min_val}). "
-                      "Setting them equal removes randomisation — use a range."
+                      f"JOIN_DELAY_MAX ({v}) must be >= JOIN_DELAY_MIN ({min_val})."
                   )
           except (AttributeError, TypeError):
               pass
@@ -114,8 +103,7 @@
                           int(part)
                       except ValueError:
                           raise ValueError(
-                              f"ADMIN_IDS contains invalid integer: {part!r}. "
-                              "Expected comma-separated Telegram user IDs (integers)."
+                              f"ADMIN_IDS contains invalid integer: {part!r}."
                           )
           return v
 
