@@ -191,9 +191,22 @@ class JoinQueueService:
         try:
             async with AsyncSessionLocal() as session:
                 repo = GroupRepository(session)
+                attempt_repo = JoinAttemptRepository(session)
                 pending = await repo.get_by_status(GroupStatus.PENDING, limit=1000)
                 approved = await repo.get_by_status(GroupStatus.APPROVED, limit=500)
-                to_reload = pending + approved
+
+                # For APPROVED groups, distinguish two cases:
+                #   a) Bot-admin approved but join never attempted → MUST re-enqueue
+                #   b) Join request sent (InviteRequestSentError) → SKIP; JoinApprovalWatcher handles these
+                approved_to_rejoin = []
+                approved_skipped_pending = 0
+                for g in approved:
+                    if await attempt_repo.has_pending_approval_attempt(g.group_id):
+                        approved_skipped_pending += 1  # already waiting for Telegram admin
+                    else:
+                        approved_to_rejoin.append(g)  # bot crashed before first join attempt
+
+                to_reload = pending + approved_to_rejoin
 
             loaded = 0
             skipped_no_link = 0
@@ -217,9 +230,15 @@ class JoinQueueService:
                 await self._queue.put(task)
                 loaded += 1
 
+            if approved_skipped_pending:
+                logger.info(
+                    "Skipped %d APPROVED group(s) with pending Telegram-admin approval — "
+                    "JoinApprovalWatcher will update them when approved",
+                    approved_skipped_pending,
+                )
             if loaded:
                 logger.info(
-                    "Reloaded %d group(s) (PENDING+APPROVED) from DB into join queue on startup",
+                    "Reloaded %d group(s) (PENDING + unattempted APPROVED) from DB into join queue",
                     loaded,
                 )
             else:
@@ -440,9 +459,10 @@ class JoinQueueService:
 
             await attempt_repo.add(
                 group_id=real_group_id or task.group_id,
+                invite_link=task.link,
                 attempt_number=task.attempt_number,
                 success=success,
-                error_message=join_error,
+                error=join_error,
             )
 
             if group:

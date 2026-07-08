@@ -295,6 +295,10 @@ async def _show_failed_page(callback: CallbackQuery, page: int) -> None:
 @router.callback_query(F.data.startswith("retry_join:"))
 async def cb_retry_join(callback: CallbackQuery) -> None:
     group_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    invite_link: str | None = None
+    title: str | None = None
+    attempt_count: int = 0
+
     async with AsyncSessionLocal() as session:
         repo = GroupRepository(session)
         attempt_repo = JoinAttemptRepository(session)
@@ -302,31 +306,62 @@ async def cb_retry_join(callback: CallbackQuery) -> None:
         if not group or not group.invite_link:
             await callback.answer("گروه یا لینک یافت نشد.", show_alert=True)
             return
-        attempts = await attempt_repo.count_for_group(group_id)
+
+        attempt_count = await attempt_repo.count_for_group(group_id)
+        invite_link = group.invite_link
+        title = group.title
+
+        # Refuse to retry if Telegram admin approval is still pending —
+        # re-sending the request wastes quota and Telegram ignores it.
+        if group.status == GroupStatus.APPROVED:
+            has_pending = await attempt_repo.has_pending_approval_attempt(group_id)
+            if has_pending:
+                await callback.answer(
+                    "⏳ درخواست عضویت قبلاً ارسال شده و در انتظار تأیید ادمین گروه است.",
+                    show_alert=True,
+                )
+                return
 
     max_attempts = 3
-    if attempts >= max_attempts:
+    if attempt_count >= max_attempts:
         await callback.answer(
             f"⚠️ حداکثر تعداد تلاش ({max_attempts} بار) رسیده.",
             show_alert=True,
         )
         return
 
+    # Reset status to PENDING so the group doesn't show as FAILED during the retry.
+    async with AsyncSessionLocal() as session:
+        repo = GroupRepository(session)
+        from app.repositories import LogRepository
+        log_repo = LogRepository(session)
+        group = await repo.get_by_group_id(group_id)
+        if group and group.status == GroupStatus.FAILED:
+            group.status = GroupStatus.PENDING
+            await log_repo.add(
+                action="group_retry_queued",
+                result="success",
+                actor=str(callback.from_user.id) if callback.from_user else "admin",
+                target=str(group_id),
+                details=f"attempt={attempt_count + 1}/{max_attempts}",
+            )
+            await session.commit()
+
     from app.services.join_queue_service import JoinQueueService
     jq = JoinQueueService.get_instance()
     await jq.enqueue(
-        group_id=group.group_id,
-        link=group.invite_link,
-        title=group.title,
-        attempt=attempts + 1,
+        group_id=group_id,
+        link=invite_link,
+        title=title,
+        attempt=attempt_count + 1,
     )
     await callback.answer(
-        f"🔄 گروه {group_id} در صف تلاش مجدد ({attempts + 1}/{max_attempts}) قرار گرفت.",
+        f"🔄 گروه {group_id} در صف تلاش مجدد ({attempt_count + 1}/{max_attempts}) قرار گرفت.",
         show_alert=True,
     )
     logger.info(
         "Manual retry queued for group_id=%d attempt=%d by admin %s",
-        group_id, attempts + 1,
+        group_id, attempt_count + 1,
         callback.from_user.id if callback.from_user else "?",
     )
 
@@ -342,10 +377,13 @@ async def cb_retry_all_failed(callback: CallbackQuery) -> None:
     async with AsyncSessionLocal() as session:
         repo = GroupRepository(session)
         attempt_repo = JoinAttemptRepository(session)
+        from app.repositories import LogRepository
+        log_repo = LogRepository(session)
         groups = await repo.get_by_status(GroupStatus.FAILED, limit=200)
         queued = 0
         skipped_max = 0
         skipped_no_link = 0
+        actor = str(callback.from_user.id) if callback.from_user else "admin"
         for g in groups:
             if not g.invite_link:
                 skipped_no_link += 1
@@ -354,6 +392,8 @@ async def cb_retry_all_failed(callback: CallbackQuery) -> None:
             if attempts >= 3:
                 skipped_max += 1
                 continue
+            # Reset status FAILED → PENDING so group shows correctly during retry
+            g.status = GroupStatus.PENDING
             await jq.enqueue(
                 group_id=g.group_id,
                 link=g.invite_link,
@@ -361,6 +401,15 @@ async def cb_retry_all_failed(callback: CallbackQuery) -> None:
                 attempt=attempts + 1,
             )
             queued += 1
+        if queued:
+            await log_repo.add(
+                action="retry_all_failed",
+                result="success",
+                actor=actor,
+                target="all_failed",
+                details=f"queued={queued} skipped_max={skipped_max} skipped_no_link={skipped_no_link}",
+            )
+            await session.commit()
 
     parts = [f"✅ <b>{queued} گروه</b> برای تلاش مجدد در صف قرار گرفتند."]
     if skipped_max:

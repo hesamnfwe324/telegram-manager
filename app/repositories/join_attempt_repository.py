@@ -65,3 +65,20 @@ class JoinAttemptRepository(BaseRepository[JoinAttempt]):
             .order_by(JoinAttempt.attempted_at.desc())
         )
         return list(result.scalars().all())
+
+    async def has_pending_approval_attempt(self, group_id: int) -> bool:
+        """Return True if the most recent join attempt for this group was a pending
+        approval request (InviteRequestSentError). Used to distinguish:
+          - APPROVED + no attempts   → bot admin approved but join never happened → re-enqueue
+          - APPROVED + pending request → Telegram admin hasn't approved yet → skip (JoinApprovalWatcher handles)
+        """
+        result = await self._session.execute(
+            select(JoinAttempt)
+            .where(JoinAttempt.group_id == group_id)
+            .order_by(JoinAttempt.attempted_at.desc())
+            .limit(1)
+        )
+        attempt = result.scalar_one_or_none()
+        if attempt is None:
+            return False
+        return attempt.error == "request_pending_approval"
