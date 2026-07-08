@@ -123,6 +123,11 @@ class JoinQueueService:
             return
         self._running = True
 
+        # ── Seed the in-memory daily counter from DB so a restart doesn't
+        # silently reset the quota tracker (counter would otherwise start at 0
+        # even if attempts already happened earlier today). ───────────────────
+        await self._init_daily_counter_from_db()
+
         # ── Critical: reload any PENDING groups from DB on every startup ──────
         # The asyncio.Queue is in-memory. When the bot restarts (deploy, crash,
         # Render restart), groups with status=PENDING in the DB would otherwise
@@ -173,6 +178,31 @@ class JoinQueueService:
             datetime.min.time(),
         ).replace(tzinfo=timezone.utc)
         return (tomorrow_midnight - now).total_seconds() + 60  # +60s buffer
+
+    # ------------------------------------------------------------------
+    # Startup daily-counter seed
+    # ------------------------------------------------------------------
+
+    async def _init_daily_counter_from_db(self) -> None:
+        """Seed the in-memory daily join counter from today's DB attempts.
+
+        The counter increments on every attempt (success or failure — see
+        _process()), so it must be seeded from count_today(), not just
+        successful joins, or a restart mid-day would under-count and let the
+        bot exceed MAX_JOINS_PER_DAY.
+        """
+        try:
+            async with AsyncSessionLocal() as session:
+                attempt_repo = JoinAttemptRepository(session)
+                count = await attempt_repo.count_today()
+            self._daily_join_date = date.today()
+            self._daily_join_count = count
+            logger.info(
+                "Daily join counter seeded from DB on startup: %d/%d",
+                count, settings.MAX_JOINS_PER_DAY,
+            )
+        except Exception as exc:
+            logger.error("Failed to seed daily join counter from DB: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Startup reload

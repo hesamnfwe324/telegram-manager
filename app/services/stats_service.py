@@ -61,8 +61,11 @@ class StatsService:
             join_queue_size = JoinQueueService.get_instance().queue_size()
             client_healthy = HealthService.get_instance().is_healthy()
         except Exception:
+            # If we can't read the real health/queue state, don't report a
+            # false "healthy" status — surface it as unhealthy/unknown instead.
+            logger.warning("Could not read live health/queue state — reporting unhealthy", exc_info=True)
             join_queue_size = 0
-            client_healthy = True
+            client_healthy = False
 
         return SystemStats(
             total_groups=total_groups,
