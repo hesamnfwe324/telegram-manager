@@ -179,22 +179,30 @@ class JoinQueueService:
     # ------------------------------------------------------------------
 
     async def _reload_pending_from_db(self) -> None:
-        """Load all PENDING groups from DB into the in-memory queue.
+        """Load all PENDING and APPROVED groups from DB into the in-memory queue.
 
         Safe to call repeatedly — uses _queued_ids to skip duplicates.
         Groups with no invite_link are skipped (cannot join without a link).
+
+        APPROVED groups are reloaded too: they represent groups where the bot admin
+        approved the join but the bot may have restarted before the Telegram-side
+        join request was sent or approved. Duplicate requests are harmless.
         """
         try:
             async with AsyncSessionLocal() as session:
                 repo = GroupRepository(session)
                 pending = await repo.get_by_status(GroupStatus.PENDING, limit=1000)
+                approved = await repo.get_by_status(GroupStatus.APPROVED, limit=500)
+                to_reload = pending + approved
 
             loaded = 0
-            for group in pending:
+            skipped_no_link = 0
+            for group in to_reload:
                 if not group.invite_link:
+                    skipped_no_link += 1
                     logger.debug(
-                        "PENDING group %d has no invite_link — cannot auto-join, skipping",
-                        group.group_id,
+                        "group %d (%s) has no invite_link — cannot auto-join, skipping",
+                        group.group_id, group.status.value,
                     )
                     continue
                 if group.group_id in self._queued_ids:
@@ -211,13 +219,15 @@ class JoinQueueService:
 
             if loaded:
                 logger.info(
-                    "Reloaded %d PENDING group(s) from DB into join queue on startup",
+                    "Reloaded %d group(s) (PENDING+APPROVED) from DB into join queue on startup",
                     loaded,
                 )
             else:
-                logger.info("No PENDING groups to reload — queue starts empty")
+                logger.info("No PENDING/APPROVED groups to reload — queue starts empty")
+            if skipped_no_link:
+                logger.debug("Skipped %d group(s) with no invite_link", skipped_no_link)
         except Exception as exc:
-            logger.error("Failed to reload PENDING groups from DB: %s", exc, exc_info=True)
+            logger.error("Failed to reload groups from DB: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Self-healing worker
@@ -436,14 +446,38 @@ class JoinQueueService:
             )
 
             if group:
-                group.status = GroupStatus.JOINED if success else GroupStatus.FAILED
-                if success:
+                # ── BUG FIX: groups requiring Telegram admin approval (صفحه درخواست عضویت)
+                # When InviteRequestSentError is raised, join_group() returns success=True
+                # with join_error='request_pending_approval'.  This does NOT mean the account
+                # is in the group — it means a request was submitted.  JoinApprovalWatcher
+                # watches for the ChatAction approval event and sets status → JOINED then.
+                # Previously this set status=JOINED immediately, which was wrong.
+                if join_error == "request_pending_approval":
+                    group.status = GroupStatus.APPROVED  # awaiting Telegram admin approval
+                    logger.info(
+                        "group_id=%d (%r): join request sent — status=APPROVED (awaiting Telegram admin)",
+                        task.group_id, task.title,
+                    )
+                elif success:
                     from datetime import datetime, timezone as tz
+                    group.status = GroupStatus.JOINED
                     group.join_date = datetime.now(tz.utc)
+                else:
+                    group.status = GroupStatus.FAILED
+
+                if join_error == "request_pending_approval":
+                    log_action = "group_join_requested"
+                    log_result = "success"
+                elif success:
+                    log_action = "group_joined"
+                    log_result = "success"
+                else:
+                    log_action = "group_join_failed"
+                    log_result = "error"
 
                 await log_repo.add(
-                    action="group_joined" if success else "group_join_failed",
-                    result="success" if success else "error",
+                    action=log_action,
+                    result=log_result,
                     target=task.link,
                     details=(
                         f"group_id={real_group_id or task.group_id} "
@@ -451,7 +485,12 @@ class JoinQueueService:
                         f"daily={self._daily_join_count}/{settings.MAX_JOINS_PER_DAY}"
                     ),
                 )
-                if success:
+                if join_error == "request_pending_approval":
+                    logger.info(
+                        "📨 Join request sent for group_id=%d (%r) — awaiting Telegram admin approval",
+                        real_group_id or task.group_id, task.title
+                    )
+                elif success:
                     logger.info(
                         "✅ Joined group_id=%d (%r)", real_group_id or task.group_id, task.title
                     )
@@ -462,8 +501,10 @@ class JoinQueueService:
 
             await session.commit()
 
-        # Only notify admins about FAILED joins — successful joins are silent
-        if settings.get_admin_id_list() and not success:
+        # Notify admins: only on FAILED joins.
+        # request_pending_approval is NOT a failure — it's a pending approval.
+        is_request_pending = (join_error == "request_pending_approval")
+        if settings.get_admin_id_list() and not success and not is_request_pending:
             await self._notify_admins(task, success)
 
     # ------------------------------------------------------------------

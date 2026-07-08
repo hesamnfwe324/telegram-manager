@@ -64,6 +64,19 @@ class SchedulerService:
             misfire_grace_time=3600,
         )
 
+        # Reload missed PENDING/APPROVED groups every 9 minutes.
+        # The join queue processes one group per ~9 min naturally, but if a group
+        # was added to the DB while the queue was draining (e.g. during discovery),
+        # or if the bot restarted and missed some groups, this periodic scan
+        # picks them up without requiring a manual restart.
+        self._scheduler.add_job(
+            self._reload_pending_groups,
+            IntervalTrigger(minutes=9),
+            id="reload_pending_groups",
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
+
         self._scheduler.start()
         logger.info("Scheduler started — %d jobs registered", len(self._scheduler.get_jobs()))
 
@@ -125,6 +138,24 @@ class SchedulerService:
                 )
         except Exception as exc:
             logger.error("Auto-retry failed: %s", exc, exc_info=True)
+
+    async def _reload_pending_groups(self) -> None:
+        """Every 9 minutes: make sure all PENDING/APPROVED groups are in the join queue.
+
+        Handles cases where a group was added to the DB while the queue was
+        draining, or where the bot restarted between discovery and queueing.
+        This is a no-op when all groups are already queued (duplicates skipped).
+        """
+        try:
+            from app.services.join_queue_service import JoinQueueService
+            jq = JoinQueueService.get_instance()
+            await jq._reload_pending_from_db()
+            logger.debug(
+                "Periodic pending-reload complete — queue_size=%d",
+                jq.queue_size(),
+            )
+        except Exception as exc:
+            logger.warning("Periodic pending-reload failed: %s", exc)
 
     async def _daily_stats_report(self) -> None:
         try:

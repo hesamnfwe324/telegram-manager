@@ -72,9 +72,10 @@ class Settings(BaseSettings):
     # anti-spam system cannot detect a fixed pattern. The range MUST have
     # MIN < MAX; setting them equal eliminates the randomness and makes the
     # account look like a bot.
-    # Recommended: MIN=900 (15 min), MAX=1800 (30 min) for low-risk operation.
-    JOIN_DELAY_MIN: int = 900   # seconds — 15 minutes
-    JOIN_DELAY_MAX: int = 1800  # seconds — 30 minutes
+    # Configured to ~9 minutes average: jitter between 8 min and 10 min.
+    # To change, set JOIN_DELAY_MIN / JOIN_DELAY_MAX env vars (in seconds).
+    JOIN_DELAY_MIN: int = 480   # seconds — 8 minutes
+    JOIN_DELAY_MAX: int = 600   # seconds — 10 minutes  (average ≈ 9 min)
 
     # ── Auto-retry for failed joins ────────────────────────────────────────────
     RETRY_FAILED_JOINS: bool = True
