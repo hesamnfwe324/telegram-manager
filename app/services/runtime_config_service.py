@@ -7,7 +7,7 @@ persisted to the `runtime_settings` DB row (survives restarts) and also
 kept in an in-memory cache on this singleton so every reader in the same
 process sees the new value instantly — no restart, no polling delay.
 """
-from typing import Any
+import asyncio
 
 from app.config import settings
 from app.database.connection import AsyncSessionLocal
@@ -25,6 +25,11 @@ class RuntimeConfigService:
         self._join_delay_min: int = settings.JOIN_DELAY_MIN
         self._join_delay_max: int = settings.JOIN_DELAY_MAX
         self._loaded = False
+        # Serializes concurrent set_join_delay() calls so a DB write followed
+        # by the in-memory cache update always happens as one atomic step —
+        # otherwise two interleaved admin edits could leave the cache holding
+        # an older value than what's actually persisted in the DB.
+        self._lock = asyncio.Lock()
 
     @classmethod
     def get_instance(cls) -> "RuntimeConfigService":
@@ -66,13 +71,16 @@ class RuntimeConfigService:
         if delay_max < delay_min:
             raise ValueError("حداکثر باید بزرگ‌تر یا مساوی حداقل باشد.")
 
-        async with AsyncSessionLocal() as session:
-            repo = RuntimeSettingRepository(session)
-            await repo.update_join_delay(delay_min, delay_max)
+        async with self._lock:
+            async with AsyncSessionLocal() as session:
+                repo = RuntimeSettingRepository(session)
+                row = await repo.update_join_delay(delay_min, delay_max)
 
-        self._join_delay_min = delay_min
-        self._join_delay_max = delay_max
-        logger.info(
-            "Join delay updated by admin: [%d, %d]s (live — takes effect on the next queued join)",
-            delay_min, delay_max,
-        )
+            # Update the cache from the row the DB actually persisted (not the
+            # raw input) so cache and DB can never diverge even under overlap.
+            self._join_delay_min = row.join_delay_min
+            self._join_delay_max = row.join_delay_max
+            logger.info(
+                "Join delay updated by admin: [%d, %d]s (live — takes effect on the next queued join)",
+                self._join_delay_min, self._join_delay_max,
+            )

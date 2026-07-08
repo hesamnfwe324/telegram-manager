@@ -236,8 +236,13 @@ def _join_delay_text() -> str:
 
 
 @router.callback_query(F.data == "join_delay_menu")
-async def cb_join_delay_menu(callback: CallbackQuery) -> None:
+async def cb_join_delay_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    # Clear any leftover "waiting_custom" FSM state from a prior visit — e.g.
+    # if the admin tapped "custom" then navigated back here via the button
+    # instead of /cancel. Without this, the next text message they send would
+    # be misinterpreted as a delay value.
+    await state.clear()
     await _safe_edit(
         callback,
         _join_delay_text(),
@@ -472,8 +477,11 @@ def _back_btn() -> InlineKeyboardMarkup:
 
 
 @router.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery) -> None:
+async def cb_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    # Clear any leftover FSM state (e.g. mid-flow "waiting for custom join
+    # delay") so returning to the main menu never leaves a stale input trap.
+    await state.clear()
     try:
         await callback.message.edit_text(  # type: ignore[union-attr]
             "🤖 <b>ربات مدیریت گروه‌های تلگرام</b>\n\nانتخاب کنید:",
