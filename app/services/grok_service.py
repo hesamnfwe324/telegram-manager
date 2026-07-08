@@ -1,8 +1,9 @@
 """
-Grok AI service — xAI-powered conversational assistant for Telegram DM engagement.
+AI chat service — Groq-powered conversational assistant for Telegram DM engagement.
 
-Maintains per-user conversation history so every exchange builds naturally
-toward a friendly, non-pushy invitation to join the channel and bot.
+Uses Groq's ultra-fast inference (llama-3.3-70b) with per-user conversation
+history for natural multi-turn dialogue that naturally invites users to join
+the channel and bot.
 """
 from __future__ import annotations
 
@@ -55,12 +56,12 @@ _SYSTEM_PROMPT = (
     "Bot      (Amazon gift cards & rewards):   {bot_link}\n"
 )
 
-XAI_BASE_URL = "https://api.x.ai/v1"
-XAI_MODEL    = "grok-3-mini"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 
 
 async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
-    """Send a message to Grok with per-user conversation history.
+    """Send a message to Groq with per-user conversation history.
     Returns the assistant reply string, or "" on failure.
     """
     api_key = settings.GROK_API_KEY
@@ -83,13 +84,13 @@ async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
-                f"{XAI_BASE_URL}/chat/completions",
+                f"{GROQ_BASE_URL}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": XAI_MODEL,
+                    "model": GROQ_MODEL,
                     "messages": messages,
                     "max_tokens": 350,
                     "temperature": 0.85,
@@ -103,17 +104,17 @@ async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
         user_hist.append({"role": "user",      "content": user_message})
         user_hist.append({"role": "assistant", "content": reply})
 
-        logger.info("Grok replied to user %d (%d chars)", user_id, len(reply))
+        logger.info("Groq replied to user %d (%d chars)", user_id, len(reply))
         return reply
 
     except httpx.HTTPStatusError as exc:
         logger.error(
-            "Grok API HTTP %s for user %d: %s",
+            "Groq API HTTP %s for user %d: %s",
             exc.response.status_code, user_id, exc.response.text[:200],
         )
         return ""
     except Exception as exc:
-        logger.error("Grok API error for user %d: %s", user_id, exc)
+        logger.error("Groq API error for user %d: %s", user_id, exc)
         return ""
 
 
