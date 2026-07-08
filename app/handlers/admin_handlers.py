@@ -451,6 +451,7 @@ async def cb_system_health(callback: CallbackQuery) -> None:
 
     buttons = [
         [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="system_health")],
+        [InlineKeyboardButton(text="🧹 پاکسازی آنی گروه‌ها", callback_data="instant_cleanup")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
     ]
     if bc_job:
@@ -585,6 +586,49 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
             "🤖 <b>ربات مدیریت گروه‌های تلگرام</b>\n\nانتخاب کنید:",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "instant_cleanup")
+async def cb_instant_cleanup(callback: CallbackQuery) -> None:
+    """پاکسازی آنی: گروه‌هایی که اکانت دیگر عضو آن‌ها نیست (بن/اخراج/ترک) را
+    فوراً از وضعیت «عضو» خارج می‌کند، بدون نیاز به منتظر ماندن برای
+    همگام‌سازی خودکار هر ۳ ساعت یکبار."""
+    await callback.answer("در حال پاکسازی...")
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            "🧹 <b>در حال پاکسازی آنی گروه‌ها...</b>\n\nلطفاً چند ثانیه صبر کنید.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    try:
+        from app.services.telegram_service import TelegramUserService
+        tg = TelegramUserService.get_instance()
+        if not tg.is_running():
+            text = "⚠️ اکانت شخصی متصل نیست — ابتدا سیستم را روشن کنید."
+        else:
+            new_count, total = await tg.sync_dialogs_to_db()
+            text = (
+                f"✅ <b>پاکسازی آنی کامل شد</b>\n\n"
+                f"📦 گروه‌های زنده فعلی: <code>{total}</code>\n"
+                f"🆕 جدید ثبت‌شده: <code>{new_count}</code>\n"
+                f"🧹 گروه‌هایی که دیگر عضوشان نبودیم، به وضعیت «ترک‌شده» منتقل شدند."
+            )
+    except Exception as exc:
+        text = f"❌ <b>خطا در پاکسازی:</b>\n<code>{str(exc)[:300]}</code>"
+
+    buttons = [
+        [InlineKeyboardButton(text="🧹 پاکسازی مجدد", callback_data="instant_cleanup")],
+        [InlineKeyboardButton(text="❤️ وضعیت سیستم", callback_data="system_health")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
+    ]
+    try:
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
     except Exception:
         pass
