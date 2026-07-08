@@ -471,6 +471,7 @@ async def cb_system_health(callback: CallbackQuery) -> None:
         f"⏱ آخرین ping OK: <code>{last_ok_str}</code>\n"
         f"📋 صف (دیتابیس): <code>{s.pending_queue_size}</code> | صف (حافظه): <code>{jq.queue_size()}</code>\n"
         f"✅ عضو شده امروز: <code>{s.today_joins}</code> | 🟢 کل: <code>{s.joined_groups}</code>\n"
+        f"🔒 بسته/محدود برای ارسال: <code>{s.write_restricted_groups}</code>\n"
         f"⚙️ فاصله عضویت: <code>{delay_min} دقیقه</code>\n"
         f"📢 Broadcast: {bc_status}",
         parse_mode="HTML",

@@ -114,6 +114,16 @@ async def _init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured")
 
+    # ── Step 4: additive column migrations ───────────────────────────────────
+    # For small backward-compatible column additions we don't want to trigger
+    # the nuclear wipe above (which would erase all groups/history). These
+    # are idempotent — safe to run on every startup.
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "ALTER TABLE groups ADD COLUMN IF NOT EXISTS can_write BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+    logger.info("Additive column migrations ensured (can_write)")
+
 
 async def _build_storage():
     """Build FSM storage — Redis if available, MemoryStorage as fallback."""

@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import BigInteger, String, Integer, Enum, DateTime, func
+from sqlalchemy import BigInteger, String, Integer, Enum, DateTime, Boolean, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.connection import Base
@@ -31,6 +31,11 @@ class Group(Base):
         nullable=False,
         index=True,
     )
+    # True unless an admin has restricted/banned the account from posting.
+    # Kept separate from `status` because the account can still be a member
+    # (status stays JOINED, group still shows up in live dialogs) while
+    # being write-restricted — the periodic dialog sync must not reset this.
+    can_write: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -40,14 +40,21 @@ PROGRESS_EVERY = 25   # edit progress message every N users
 
 _MAX_BROADCAST_SECONDS: int = 3600
 
-# Failure reasons that mean the account is no longer a usable member of the
-# group (kicked, banned, left, chat deleted, etc). When a broadcast hits one
-# of these, the group is stale in the DB and will just keep failing on every
-# future broadcast until someone manually re-syncs — so we mark it LEFT
-# immediately instead of waiting for a manual sync.
-_GROUP_UNREACHABLE_MARKERS = (
+# Failure reasons that mean the account can no longer post there because it
+# has been banned/restricted from *writing*, but may still technically be a
+# member (still shows up in live dialogs). These get can_write=False instead
+# of status=LEFT, because the periodic dialog sync re-marks every live
+# dialog as JOINED and would otherwise silently undo a LEFT here.
+_GROUP_WRITE_RESTRICTED_MARKERS = (
     "banned",
     "no_write_permission",
+    "restricted",
+)
+
+# Failure reasons that mean the group/chat itself is gone or the account was
+# fully removed (kicked, chat deleted, entity can't be resolved at all).
+# Safe to mark LEFT immediately instead of waiting for the next manual/auto sync.
+_GROUP_UNREACHABLE_MARKERS = (
     "chat not found",
     "entity_not_found",
     "channel_private",
@@ -59,11 +66,19 @@ _GROUP_UNREACHABLE_MARKERS = (
 )
 
 
-def _is_group_unreachable(reason: str | None) -> bool:
+def _matches_any(reason: str | None, markers: tuple[str, ...]) -> bool:
     if not reason:
         return False
     r = reason.lower()
-    return any(marker in r for marker in _GROUP_UNREACHABLE_MARKERS)
+    return any(marker in r for marker in markers)
+
+
+def _is_write_restricted(reason: str | None) -> bool:
+    return _matches_any(reason, _GROUP_WRITE_RESTRICTED_MARKERS)
+
+
+def _is_group_unreachable(reason: str | None) -> bool:
+    return _matches_any(reason, _GROUP_UNREACHABLE_MARKERS)
 
 
 @dataclass
@@ -406,15 +421,24 @@ class BroadcastQueueService:
         dialog_groups = await tg.get_all_groups_from_dialogs(limit=3000)
         dialog_ids = {g["group_id"] for g in dialog_groups}
 
-        # ── Step 2: DB-only joined groups not in live dialogs (edge cases) ────
+        # ── Step 2: DB-only joined+writable groups not in live dialogs (edge cases) ─
         async with AsyncSessionLocal() as session:
             repo = GroupRepository(session)
-            db_groups = await repo.get_joined()
-        db_by_id = {g.group_id: g for g in db_groups}
+            db_groups = await repo.get_broadcastable()
+            # Need can_write for *all* joined groups (not just writable ones)
+            # so we can also skip live dialogs the account is restricted in.
+            all_joined = await repo.get_joined()
+        db_by_id = {g.group_id: g for g in all_joined}
 
         target_groups: list[dict] = []
+        skipped_restricted = 0
         for dg in dialog_groups:
             db_g = db_by_id.get(dg["group_id"])
+            if db_g is not None and not db_g.can_write:
+                # Still a member (shows up live), but banned/restricted from
+                # posting — don't waste an attempt, it will just fail again.
+                skipped_restricted += 1
+                continue
             target_groups.append({
                 "group_id": dg["group_id"],
                 "title": dg["title"],
@@ -429,6 +453,11 @@ class BroadcastQueueService:
                     "invite_link": db_g.invite_link,
                     "username": db_g.username,
                 })
+        if skipped_restricted:
+            logger.info(
+                "Broadcast job: skipped %d write-restricted groups (still joined, can't post)",
+                skipped_restricted,
+            )
 
         job.total = len(target_groups)
         actor = str(job.actor_id)
@@ -474,7 +503,9 @@ class BroadcastQueueService:
                 job.failed += 1
                 if job.first_group_error is None:
                     job.first_group_error = f"gid={group_id}: {reason}"
-                if _is_group_unreachable(reason):
+                if _is_write_restricted(reason):
+                    await self._mark_group_write_restricted(group_id, reason)
+                elif _is_group_unreachable(reason):
                     await self._mark_group_left(group_id, reason)
                 if reason == "peer_flood":
                     peer_flood_count_g += 1
@@ -558,6 +589,24 @@ class BroadcastQueueService:
                     )
         except Exception as exc:
             logger.warning("Failed to mark group %d as left: %s", group_id, exc)
+
+    async def _mark_group_write_restricted(self, group_id: int, reason: str | None) -> None:
+        """Flip can_write off for a group that is still joined but where the
+        account is banned/restricted from posting. Kept separate from status
+        so the periodic dialog sync (which re-marks every live dialog as
+        JOINED) doesn't silently undo the exclusion."""
+        try:
+            async with AsyncSessionLocal() as s:
+                repo = GroupRepository(s)
+                updated = await repo.mark_write_restricted(group_id)
+                await s.commit()
+                if updated:
+                    logger.info(
+                        "Marked group %d as write-restricted after broadcast failure (%s)",
+                        group_id, reason,
+                    )
+        except Exception as exc:
+            logger.warning("Failed to mark group %d write-restricted: %s", group_id, exc)
 
     async def _mark_user_blocked(self, user_id: int) -> None:
         try:

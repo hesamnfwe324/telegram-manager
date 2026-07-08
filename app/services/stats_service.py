@@ -17,6 +17,7 @@ class SystemStats:
     pending_groups: int
     joined_groups: int
     failed_groups: int
+    write_restricted_groups: int  # joined but banned/restricted from posting
     total_links: int
     pending_links: int
     total_logs: int
@@ -43,6 +44,7 @@ class StatsService:
             pending_groups = await group_repo.count_by_status(GroupStatus.PENDING)
             joined_groups = await group_repo.count_by_status(GroupStatus.JOINED)
             failed_groups = await group_repo.count_by_status(GroupStatus.FAILED)
+            write_restricted_groups = await group_repo.count_write_restricted()
             total_links = await link_repo.count()
             pending_links = await link_repo.count_by_status(LinkStatus.PENDING)
             total_logs = await log_repo.count()
@@ -72,6 +74,7 @@ class StatsService:
             pending_groups=pending_groups,
             joined_groups=joined_groups,
             failed_groups=failed_groups,
+            write_restricted_groups=write_restricted_groups,
             total_links=total_links,
             pending_links=pending_links,
             total_logs=total_logs,

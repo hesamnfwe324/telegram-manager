@@ -47,6 +47,16 @@ class GroupRepository(BaseRepository[Group]):
         )
         return result.scalar_one()
 
+    async def count_write_restricted(self) -> int:
+        """JOINED groups the account is banned/restricted from posting in."""
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(Group)
+            .where(Group.status == GroupStatus.JOINED)
+            .where(Group.can_write.is_(False))
+        )
+        return result.scalar_one()
+
     async def upsert(self, group_id: int, **kwargs: object) -> tuple[Group, bool]:
         existing = await self.get_by_group_id(group_id)
         created = False
@@ -72,6 +82,35 @@ class GroupRepository(BaseRepository[Group]):
 
     async def get_joined(self) -> list[Group]:
         return await self.get_by_status(GroupStatus.JOINED, limit=5000)
+
+    async def get_broadcastable(self) -> list[Group]:
+        """JOINED groups the account can actually still post in.
+
+        Excludes groups where `can_write` was flipped off after a
+        write-forbidden/banned-from-posting error, even though the account
+        remains a member (status stays JOINED) and the group still shows up
+        in the live dialog list.
+        """
+        result = await self._session.execute(
+            select(Group)
+            .where(Group.status == GroupStatus.JOINED)
+            .where(Group.can_write.is_(True))
+            .order_by(Group.created_at.desc())
+            .limit(5000)
+        )
+        return list(result.scalars().all())
+
+    async def mark_write_restricted(self, group_id: int) -> bool:
+        """Flip can_write off for a group that is still joined but where the
+        account has been banned/restricted from posting. Returns True if a
+        row was updated."""
+        result = await self._session.execute(
+            update(Group)
+            .where(Group.group_id == group_id)
+            .where(Group.can_write.is_(True))
+            .values(can_write=False)
+        )
+        return result.rowcount > 0
 
     async def get_recently_joined(self, limit: int = 2) -> list[Group]:
         """Groups with status=JOINED, most recent join first.
