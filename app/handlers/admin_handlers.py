@@ -6,6 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from datetime import datetime, timezone
+from html import escape as _esc
 from app.config import settings
 from app.services.runtime_config_service import RuntimeConfigService
 from app.utils.logger import get_logger
@@ -224,7 +225,6 @@ async def cb_recent_groups(callback: CallbackQuery) -> None:
     await callback.answer()
 
     import asyncio
-    from html import escape as _esc
 
     from app.database.connection import AsyncSessionLocal
     from app.repositories.group_repository import GroupRepository
@@ -549,9 +549,14 @@ async def cb_error_logs(callback: CallbackQuery) -> None:
     lines = [f"🚨 <b>آخرین خطاها ({len(logs)}):</b>\n"]
     for log in logs:
         ts = log.timestamp.strftime("%m/%d %H:%M") if log.timestamp else "?"
-        detail = (log.error_message or log.details or "")[:60]
+        # Escape DB-sourced text before embedding in HTML — error messages can
+        # legally contain <, >, & (e.g. from exception text or raw HTML in a
+        # scraped title), which would otherwise break Telegram's HTML parser
+        # and make this whole message fail to send.
+        action = _esc(log.action or "")
+        detail = _esc((log.error_message or log.details or "")[:60])
         lines.append(
-            f"⏱ <code>{ts}</code>  <b>{log.action}</b>"
+            f"⏱ <code>{ts}</code>  <b>{action}</b>"
             + (f"\n<i>{detail}</i>" if detail else "")
         )
 

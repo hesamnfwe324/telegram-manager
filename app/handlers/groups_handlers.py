@@ -9,6 +9,7 @@ Fixes applied:
   3. cb_groups_failed: add full pagination support (was limited to 20 with no next page).
 """
 import hashlib
+from html import escape as _esc
 from aiogram import Router, F
 from aiogram.filters import StateFilter
 from aiogram.fsm.state import default_state
@@ -84,7 +85,7 @@ async def _show_groups_page(callback: CallbackQuery, page: int) -> None:
     lines = [f"📋 <b>گروه‌ها</b> (صفحه {page + 1} از {max(1, -(-total // PAGE_SIZE))}):\n"]
     for g in groups:
         emoji = _status_emoji(g.status)
-        title = (g.title or "بدون عنوان")[:35]
+        title = _esc((g.title or "بدون عنوان")[:35])
         lines.append(f"{emoji} <code>{g.group_id}</code> — {title}")
 
     await callback.message.edit_text(  # type: ignore[union-attr]
@@ -129,10 +130,11 @@ async def _show_pending_page(callback: CallbackQuery, page: int) -> None:
     action_btns: list[list[InlineKeyboardButton]] = []
 
     for g in groups:
-        title = (g.title or str(g.group_id))[:25]
+        raw_title = (g.title or str(g.group_id))[:25]
+        title = _esc(raw_title)
         lines.append(f"• <code>{g.group_id}</code> — {title}")
         action_btns.append([
-            InlineKeyboardButton(text=f"✅ {title}", callback_data=f"approve:{g.group_id}"),
+            InlineKeyboardButton(text=f"✅ {raw_title}", callback_data=f"approve:{g.group_id}"),
             InlineKeyboardButton(text="❌ رد", callback_data=f"reject:{g.group_id}"),
         ])
 
@@ -262,11 +264,12 @@ async def _show_failed_page(callback: CallbackQuery, page: int) -> None:
     btns: list[list[InlineKeyboardButton]] = []
 
     for g in groups:
-        title = (g.title or str(g.group_id))[:25]
+        raw_title = (g.title or str(g.group_id))[:25]
+        title = _esc(raw_title)
         lines.append(f"• <code>{g.group_id}</code> — {title}")
         btns.append([
             InlineKeyboardButton(
-                text=f"🔄 {title}",
+                text=f"🔄 {raw_title}",
                 callback_data=f"retry_join:{g.group_id}",
             )
         ])
@@ -483,7 +486,7 @@ async def handle_admin_link(message: Message) -> None:
                 existing = await group_repo.get_by_group_id(group_id)
                 if existing:
                     results.append(
-                        f"ℹ️ قبلاً ثبت شده: <b>{title or group_id}</b> — وضعیت: {existing.status.value}"
+                        f"ℹ️ قبلاً ثبت شده: <b>{_esc(str(title or group_id))}</b> — وضعیت: {existing.status.value}"
                     )
                     continue
 
@@ -491,7 +494,7 @@ async def handle_admin_link(message: Message) -> None:
                 if existing_by_link:
                     results.append(
                         f"ℹ️ قبلاً با این لینک ثبت شده: "
-                        f"<b>{existing_by_link.title or existing_by_link.group_id}</b>"
+                        f"<b>{_esc(str(existing_by_link.title or existing_by_link.group_id))}</b>"
                         f" — وضعیت: {existing_by_link.status.value}"
                     )
                     continue
@@ -509,7 +512,7 @@ async def handle_admin_link(message: Message) -> None:
             jq = JoinQueueService.get_instance()
             await jq.enqueue(group_id=group_id, link=normalized, title=title)
             results.append(
-                f"✅ در صف عضویت: <b>{title or str(group_id)}</b>"
+                f"✅ در صف عضویت: <b>{_esc(str(title or group_id))}</b>"
                 + (f" ({members_count:,} عضو)" if members_count else "")
             )
             logger.info(

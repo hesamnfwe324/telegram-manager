@@ -17,8 +17,12 @@ class GroupRepository(BaseRepository[Group]):
         return result.scalar_one_or_none()
 
     async def get_by_username(self, username: str) -> Group | None:
+        # Compare case-insensitively at the DB level too (defense in depth):
+        # write paths already lowercase before storing, but a case-insensitive
+        # comparison here means the lookup stays correct even if a future
+        # write path forgets to lowercase, or a legacy row was stored mixed-case.
         result = await self._session.execute(
-            select(Group).where(Group.username == username.lower())
+            select(Group).where(func.lower(Group.username) == username.lower())
         )
         return result.scalar_one_or_none()
 

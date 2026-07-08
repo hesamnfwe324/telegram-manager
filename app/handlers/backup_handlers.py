@@ -78,28 +78,6 @@ async def cb_backup_list(callback: CallbackQuery) -> None:
     )
 
 
-@router.callback_query(F.data == "error_logs")
-async def cb_error_logs(callback: CallbackQuery) -> None:
-    await callback.answer()
-    from app.database.connection import AsyncSessionLocal
-    from app.repositories import LogRepository
-
-    async with AsyncSessionLocal() as session:
-        log_repo = LogRepository(session)
-        logs = await log_repo.get_errors(limit=20)
-
-    if not logs:
-        await callback.message.edit_text("✅ هیچ خطایی ثبت نشده.", reply_markup=_back_btn())  # type: ignore[union-attr]
-        return
-
-    lines = [f"🚨 <b>آخرین {len(logs)} خطا:</b>\n"]
-    for log in logs:
-        ts = log.timestamp.strftime("%m/%d %H:%M") if log.timestamp else "—"
-        err = (log.error_message or "")[:60]
-        lines.append(f"<code>{ts}</code> | {log.action} | {err}")
-
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=_back_btn(),
-    )
+# NOTE: "error_logs" is handled by admin_handlers.cb_error_logs (registered
+# first in the router chain, so this duplicate was dead code that could never
+# run — removed to avoid confusion about which implementation is live).

@@ -193,9 +193,23 @@ async def main() -> None:
     # Start HTTP health server first so Render marks the service healthy immediately
     health_http_server = await _start_health_server()
 
-    await _check_db()
-    await _init_db()
-    await RuntimeConfigService.get_instance().load()
+    try:
+        await _check_db()
+        await _init_db()
+        await RuntimeConfigService.get_instance().load()
+    except BaseException:
+        # If DB setup fails after the health server is already answering
+        # "OK" (either via _check_db's sys.exit(1) — which raises SystemExit,
+        # a BaseException, not caught by `except Exception` — or via an
+        # exception from _init_db), Render would keep routing traffic to a
+        # container that can never actually serve requests. Close the health
+        # server first on ANY failure path here so the platform sees this
+        # instance as down and can route to/restart a healthy one instead of
+        # leaving a zombie "healthy" container.
+        logger.error("Startup DB check/initialization failed — shutting down", exc_info=True)
+        health_http_server.close()
+        await health_http_server.wait_closed()
+        raise
 
     bot = Bot(
         token=settings.BOT_TOKEN,

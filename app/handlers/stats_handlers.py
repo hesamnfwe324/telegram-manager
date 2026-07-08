@@ -1,6 +1,7 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timezone
+from html import escape as _esc
 
 from app.services.stats_service import StatsService
 from app.utils.logger import get_logger
@@ -47,6 +48,6 @@ async def cb_stats(callback: CallbackQuery) -> None:
         f"  {health_icon} User Client: {'سالم' if s.client_healthy else 'مشکل دارد'}\n"
         f"  📝 لاگ‌ها: <code>{s.total_logs}</code>\n\n"
         f"⏱ آخرین فعالیت: <code>{last_act}</code>\n"
-        f"📌 آخرین گروه: <code>{s.last_group_title or '—'}</code>"
+        f"📌 آخرین گروه: <code>{_esc(s.last_group_title) if s.last_group_title else '—'}</code>"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=_back_btn())  # type: ignore[union-attr]

@@ -383,6 +383,7 @@ class TelegramUserService:
         bot: Any = None,
     ) -> tuple[bool, str | None]:
         """Download a Bot API file and re-upload it to a user via Telethon."""
+        bio = None
         try:
             bio = await self._download_bot_file(media_file_id, bot)
             if bio is None:
@@ -402,6 +403,12 @@ class TelegramUserService:
         except Exception as exc:
             logger.error("Failed to send media to user %d: %s", user_id, exc)
             return False, str(exc)
+        finally:
+            # Release the in-memory download buffer as soon as we're done with
+            # it — otherwise it lingers until GC, wasting memory on busy
+            # broadcast runs with many large media files in flight.
+            if bio is not None:
+                bio.close()
 
     # ------------------------------------------------------------------
     # Core broadcast method for groups
@@ -499,6 +506,8 @@ class TelegramUserService:
                         # Fall through to text if we have it
                         if not message_text:
                             return False, str(media_exc)
+                    finally:
+                        bio.close()
                 else:
                     logger.warning(
                         "Could not download file_id for group %d — trying text fallback",
@@ -708,6 +717,8 @@ class TelegramUserService:
                         )
                         if not message_text:
                             return False, str(media_exc)
+                    finally:
+                        bio.close()
                 else:
                     logger.warning("Could not download file_id for user %d — text fallback", user_id)
                     if not message_text:
