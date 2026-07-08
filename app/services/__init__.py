@@ -10,6 +10,7 @@ from .broadcast_queue_service import BroadcastQueueService
 from .scheduler_service import SchedulerService
 from .join_approval_service import JoinApprovalWatcher
 from .forced_subscribe_service import ForcedSubscribeService
+from .runtime_config_service import RuntimeConfigService
 
 __all__ = [
     "TelegramUserService",
@@ -24,4 +25,5 @@ __all__ = [
     "SchedulerService",
     "JoinApprovalWatcher",
     "ForcedSubscribeService",
+    "RuntimeConfigService",
 ]

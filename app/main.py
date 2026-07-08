@@ -24,6 +24,7 @@ from app.services import (
     SchedulerService,
     JoinApprovalWatcher,
     ForcedSubscribeService,
+    RuntimeConfigService,
 )
 
 logger = get_logger(__name__)
@@ -194,6 +195,7 @@ async def main() -> None:
 
     await _check_db()
     await _init_db()
+    await RuntimeConfigService.get_instance().load()
 
     bot = Bot(
         token=settings.BOT_TOKEN,

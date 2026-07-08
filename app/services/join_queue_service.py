@@ -368,7 +368,11 @@ class JoinQueueService:
             return
 
         # ── Anti-detection delay: randomised jitter in [MIN, MAX] seconds ─────
-        delay = random.uniform(settings.JOIN_DELAY_MIN, settings.JOIN_DELAY_MAX)
+        # Read live (admin-adjustable) values — a change made mid-queue takes
+        # effect immediately on the next task, no restart needed.
+        from app.services.runtime_config_service import RuntimeConfigService
+        delay_min, delay_max = RuntimeConfigService.get_instance().get_join_delay()
+        delay = random.uniform(delay_min, delay_max)
         logger.info(
             "Waiting %.0fs (%.1f min) before joining group_id=%d (%r)  "
             "[daily: %d/%d]",

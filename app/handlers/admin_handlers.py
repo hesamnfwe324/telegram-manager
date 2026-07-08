@@ -2,13 +2,26 @@ from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from datetime import datetime, timezone
 from app.config import settings
+from app.services.runtime_config_service import RuntimeConfigService
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 router = Router(name="admin")
+
+
+class JoinDelayStates(StatesGroup):
+    waiting_custom = State()
+
+
+def _current_delay_min() -> int:
+    """Live (admin-adjustable) join delay midpoint in whole minutes, for display."""
+    lo, hi = RuntimeConfigService.get_instance().get_join_delay()
+    return round(((lo + hi) / 2) / 60)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -39,6 +52,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📋 وضعیت صف عضویت", callback_data="queue_status"),
+            InlineKeyboardButton(text="⚙️ فاصله عضویت", callback_data="join_delay_menu"),
         ],
         [InlineKeyboardButton(text="🔄 همگام‌سازی گروه‌ها", callback_data="sync_dialogs"),
             InlineKeyboardButton(text="👥 همگام‌سازی مخاطبین", callback_data="sync_users")],
@@ -129,7 +143,7 @@ async def cmd_queue_status(message: Message) -> None:
         today_count = await attempt_repo.count_today()
 
     from datetime import datetime, timezone
-    delay_min = settings.JOIN_DELAY_MIN // 60
+    delay_min = _current_delay_min()
     eta_minutes = queue_size * delay_min
     now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     if eta_minutes == 0:
@@ -162,7 +176,7 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     s = await StatsService().get_stats()
 
     from datetime import datetime, timezone
-    delay_min = settings.JOIN_DELAY_MIN // 60
+    delay_min = _current_delay_min()
     queue_db = s.pending_queue_size
     queue_mem = s.join_queue_size
     eta_minutes = queue_db * delay_min
@@ -193,6 +207,120 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
         f"⚙️ فاصله بین عضویت‌ها: <code>{delay_min} دقیقه</code>",
         parse_mode="HTML",
         reply_markup=back_kb,
+    )
+
+
+def _join_delay_keyboard() -> InlineKeyboardMarkup:
+    presets = [15, 30, 45, 60, 90, 120]
+    rows = []
+    for i in range(0, len(presets), 3):
+        rows.append([
+            InlineKeyboardButton(text=f"{m} دقیقه", callback_data=f"jd_preset:{m}")
+            for m in presets[i:i + 3]
+        ])
+    rows.append([InlineKeyboardButton(text="✏️ مقدار دلخواه", callback_data="jd_custom")])
+    rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _join_delay_text() -> str:
+    lo, hi = RuntimeConfigService.get_instance().get_join_delay()
+    lo_min, hi_min = lo / 60, hi / 60
+    return (
+        "⚙️ <b>تنظیم فاصله عضویت در گروه‌ها</b>\n\n"
+        f"فاصله فعلی: <b>{lo_min:.0f} تا {hi_min:.0f} دقیقه</b> (تصادفی بین این دو، برای جلوگیری از شناسایی توسط تلگرام)\n\n"
+        "یک مقدار میانگین از گزینه‌های زیر انتخاب کنید (بازه ۲۵٪± حول آن به‌صورت خودکار تنظیم می‌شود)، "
+        "یا مقدار دلخواه خود را به دقیقه وارد کنید.\n\n"
+        "⚡️ تغییر بلافاصله و بدون نیاز به ری‌استارت اعمال می‌شود."
+    )
+
+
+@router.callback_query(F.data == "join_delay_menu")
+async def cb_join_delay_menu(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _safe_edit(
+        callback,
+        _join_delay_text(),
+        parse_mode="HTML",
+        reply_markup=_join_delay_keyboard(),
+    )
+
+
+async def _apply_join_delay_minutes(average_minutes: float) -> tuple[int, int]:
+    """Apply a new average delay (in minutes) with ±25% jitter range, return (min_s, max_s)."""
+    avg_seconds = average_minutes * 60
+    delay_min = max(1, round(avg_seconds * 0.75))
+    delay_max = max(delay_min + 1, round(avg_seconds * 1.25))
+    await RuntimeConfigService.get_instance().set_join_delay(delay_min, delay_max)
+    return delay_min, delay_max
+
+
+@router.callback_query(F.data.startswith("jd_preset:"))
+async def cb_join_delay_preset(callback: CallbackQuery) -> None:
+    minutes = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    try:
+        await _apply_join_delay_minutes(minutes)
+        await callback.answer(f"✅ فاصله عضویت روی {minutes} دقیقه تنظیم شد.", show_alert=True)
+    except ValueError as exc:
+        await callback.answer(f"❌ {exc}", show_alert=True)
+        return
+    actor = callback.from_user.id if callback.from_user else "?"
+    logger.info("Join delay changed by admin %s → %d min average", actor, minutes)
+    await _safe_edit(
+        callback,
+        _join_delay_text(),
+        parse_mode="HTML",
+        reply_markup=_join_delay_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "jd_custom")
+async def cb_join_delay_custom(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(JoinDelayStates.waiting_custom)
+    await _safe_edit(
+        callback,
+        "✏️ <b>مقدار دلخواه</b>\n\n"
+        "عدد فاصله عضویت را به دقیقه ارسال کنید (مثلاً <code>50</code>).\n"
+        "برای لغو /cancel",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="join_delay_menu")],
+        ]),
+    )
+
+
+@router.message(JoinDelayStates.waiting_custom, F.text == "/cancel")
+async def cancel_join_delay_custom(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("❌ لغو شد.", reply_markup=main_menu_keyboard())
+
+
+@router.message(JoinDelayStates.waiting_custom)
+async def receive_join_delay_custom(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    try:
+        minutes = float(text)
+        if minutes <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ لطفاً یک عدد معتبر و بزرگ‌تر از صفر به دقیقه ارسال کنید.")
+        return
+
+    await state.clear()
+    try:
+        delay_min, delay_max = await _apply_join_delay_minutes(minutes)
+    except ValueError as exc:
+        await message.answer(f"❌ {exc}")
+        return
+
+    actor = message.from_user.id if message.from_user else "?"
+    logger.info("Join delay changed by admin %s → %.1f min average (custom)", actor, minutes)
+    await message.answer(
+        f"✅ فاصله عضویت به‌صورت لحظه‌ای تغییر کرد.\n"
+        f"میانگین: <b>{minutes:.0f} دقیقه</b> (بازه: {delay_min // 60}–{delay_max // 60} دقیقه)",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -234,7 +362,7 @@ async def cb_system_health(callback: CallbackQuery) -> None:
 
     from datetime import datetime, timezone
     now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    delay_min = settings.JOIN_DELAY_MIN // 60
+    delay_min = _current_delay_min()
     await _safe_edit(
         callback,
         "❤️ <b>وضعیت سیستم</b>\n"
