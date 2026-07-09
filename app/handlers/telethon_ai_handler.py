@@ -1,11 +1,21 @@
 """
 Telethon AI handler — responds to incoming private DMs on the personal
-user account using Groq AI with multi-step friendly conversation.
+user account using Groq AI.
+
+Speed optimisations:
+- Dispatches every DM to a background asyncio task immediately so the
+  Telethon update loop is NEVER blocked waiting for Groq.
+- Typing action is sent as a fire-and-forget coroutine; it must not
+  delay the actual reply.
 """
+from __future__ import annotations
+
+import asyncio
+
 from telethon import events
 
 from app.config import settings
-from app.services.grok_service import chat, clear_history
+from app.services.grok_service import chat
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -16,13 +26,15 @@ def _admin_ids() -> set[int]:
 
 
 async def process_message(event: events.NewMessage.Event) -> None:
-    """Handle incoming private messages on the Telethon user account."""
+    """Called by Telethon for every incoming private message.
+
+    Returns immediately — all real work is done in a background task so
+    the Telethon update loop can keep moving through the queue.
+    """
     try:
         sender_id = event.sender_id
         if sender_id is None:
             return
-
-        # Skip admin users
         if sender_id in _admin_ids():
             return
 
@@ -30,33 +42,48 @@ async def process_message(event: events.NewMessage.Event) -> None:
         if not text:
             return
 
-        logger.info("AI DM received from user %d: %r", sender_id, text[:60])
+        # Fire-and-forget — do NOT await this
+        asyncio.create_task(_reply(event, sender_id, text))
 
+    except Exception as exc:
+        logger.error("AI handler dispatch error: %s", exc)
+
+
+async def _reply(event: events.NewMessage.Event, sender_id: int, text: str) -> None:
+    """Background task: call Groq and send the reply."""
+    try:
         sender = await event.get_sender()
         user_name = getattr(sender, "first_name", "") or ""
 
-        # Show typing indicator
-        async with event.client.action(event.chat_id, "typing"):
-            reply = await chat(sender_id, text, user_name=user_name)
+        # Send typing action in background — don't wait for it
+        asyncio.create_task(_send_typing(event))
+
+        reply = await chat(sender_id, text, user_name=user_name)
 
         if reply:
             await event.reply(reply)
             logger.info("AI replied to user %d (%d chars)", sender_id, len(reply))
         else:
-            # Fallback — confirms handler is working even if Groq fails
-            logger.warning("Groq returned empty reply for user %d — using fallback", sender_id)
             greeting = f"سلام {user_name}! 👋" if user_name else "سلام! 👋"
             await event.reply(greeting)
 
     except Exception as exc:
-        logger.error("Telethon AI handler error: %s", exc, exc_info=True)
+        logger.error("AI _reply error for user %d: %s", sender_id, exc, exc_info=True)
+
+
+async def _send_typing(event: events.NewMessage.Event) -> None:
+    """Send typing indicator — best-effort, never blocks the reply."""
+    try:
+        await event.client.action(event.chat_id, "typing").__aenter__()
+    except Exception:
+        pass
 
 
 def register(tg_service) -> None:
-    """Register this handler directly on the Telethon client with proper filters.
+    """Register this handler on the Telethon client.
 
-    Uses incoming=True + is_private filter so we ONLY react to messages
-    sent TO this account (not our own outgoing messages, not group messages).
+    Filter: incoming=True + is_private — only reacts to messages sent
+    directly TO this personal account, never group or channel traffic.
     """
     tg_service.client.add_event_handler(
         process_message,
@@ -65,4 +92,4 @@ def register(tg_service) -> None:
             func=lambda e: e.is_private,
         ),
     )
-    logger.info("Telethon AI private-DM handler registered")
+    logger.info("Telethon AI private-DM handler registered (background-task mode)")
