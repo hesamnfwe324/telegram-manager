@@ -1,6 +1,7 @@
 """
 AI DM handler — intercepts private messages from non-admin users and
 replies with a Grok-powered conversational assistant.
+Uses message.reply() so every response is threaded to the user's message.
 """
 from aiogram import Router, F
 from aiogram.types import Message
@@ -32,15 +33,15 @@ async def cmd_start_ai(message: Message) -> None:
 
     reply = await chat(user_id, "/start", user_name=user_name)
     if reply:
-        await message.answer(reply)
+        await message.reply(reply)
     else:
-        greeting = f"سلام {user_name}! 👋" if user_name else "سلام! 👋"
-        await message.answer(f"{greeting} خوشحالم که اومدی 😊")
+        greeting = f"Hey {user_name}! 👋" if user_name else "Hey! 👋"
+        await message.reply(greeting)
 
 
 @router.message(F.chat.type == "private")
 async def handle_dm(message: Message) -> None:
-    """Main private DM handler — relay to Grok and reply."""
+    """Main private DM handler — relay to Grok and reply to the specific message."""
     if not message.from_user:
         return
     if _is_admin(message.from_user.id):
@@ -59,6 +60,7 @@ async def handle_dm(message: Message) -> None:
         )
         reply = await chat(user_id, text, user_name=user_name)
         if reply:
-            await message.answer(reply)
+            # reply() threads the response to the user's exact message
+            await message.reply(reply)
     except Exception as exc:
         logger.error("AI handler error for user %d: %s", user_id, exc)
