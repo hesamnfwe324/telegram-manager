@@ -175,7 +175,10 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
     """وضعیت صف عضویت — همه اعداد از StatsService (منبع واحد)."""
     await callback.answer()
     from app.services.stats_service import StatsService
+    from app.services.join_queue_service import JoinQueueService
+    import asyncio as _asyncio
     s = await StatsService().get_stats()
+    jq = JoinQueueService.get_instance()
 
     from datetime import datetime, timezone
     delay_min = _current_delay_min()
@@ -192,15 +195,27 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
 
     status_icon = "⏳" if queue_db > 0 else "✅"
 
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="queue_status")],
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")],
-    ])
+    # ── نمایش وضعیت توقف صف ──────────────────────────────────────────────────
+    paused = jq.is_paused()
+    if paused:
+        remaining_secs = max(0, int(jq._pause_until - _asyncio.get_event_loop().time()))
+        remaining_min = remaining_secs // 60
+        pause_line = f"\n🔴 <b>صف متوقف است (PeerFlood)</b> — {remaining_min} دقیقه باقیمانده"
+    else:
+        pause_line = "\n🟢 صف در حال اجرا است"
+
+    kb_rows = []
+    if paused:
+        kb_rows.append([InlineKeyboardButton(text="▶️ از سرگیری صف", callback_data="resume_queue")])
+    kb_rows.append([InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="queue_status")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="main_menu")])
+    back_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     await _safe_edit(
         callback,
         f"📋 <b>وضعیت صف عضویت</b>\n"
-        f"⏱ بروزرسانی: <code>{now_str}</code>\n\n"
+        f"⏱ بروزرسانی: <code>{now_str}</code>"
+        f"{pause_line}\n\n"
         f"{status_icon} در صف (دیتابیس): <code>{queue_db}</code> گروه\n"
         f"{status_icon} در صف (حافظه): <code>{queue_mem}</code> گروه\n"
         f"✅ عضو شده امروز: <code>{s.today_joins}</code> گروه\n"
@@ -211,6 +226,18 @@ async def cb_queue_status(callback: CallbackQuery) -> None:
         reply_markup=back_kb,
     )
 
+
+@router.callback_query(F.data == "resume_queue")
+async def cb_resume_queue(callback: CallbackQuery) -> None:
+    """از سرگیری دستی صف عضویت متوقف‌شده."""
+    await callback.answer()
+    from app.services.join_queue_service import JoinQueueService
+    jq = JoinQueueService.get_instance()
+    if jq.is_paused():
+        jq.resume()
+        await _safe_edit(callback, "▶️ صف عضویت از سرگیری شد. عضویت گروه‌ها ادامه می‌یابد.", parse_mode="HTML")
+    else:
+        await _safe_edit(callback, "ℹ️ صف در حال حاضر متوقف نیست.", parse_mode="HTML")
 
 def _recent_groups_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
