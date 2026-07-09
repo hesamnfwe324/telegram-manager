@@ -14,7 +14,7 @@ from app.config import settings
 from app.utils.logger import get_logger, setup_logging
 from app.database.connection import engine, Base, AsyncSessionLocal
 from app.handlers import get_main_router
-from app.handlers.telethon_ai_handler import process_message as ai_dm_handler
+from app.handlers.telethon_ai_handler import register as register_ai_dm
 from app.middlewares import AdminAuthMiddleware
 from app.services import (
     TelegramUserService,
@@ -259,7 +259,7 @@ async def main() -> None:
             discovery = DiscoveryService(tg)
             tg.on_new_message(discovery.process_message)
             tg.on_new_message(forced_subscribe.process_message)
-            tg.on_new_message(ai_dm_handler)  # AI replies to private DMs
+            register_ai_dm(tg)  # AI replies to private DMs on personal account
             await approval_watcher.start()   # watch for approved join requests
             await jq.start()
             await health.start()

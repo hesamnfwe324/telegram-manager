@@ -11,44 +11,58 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def _is_admin(user_id: int) -> bool:
-    return user_id in {
-        int(x) for x in settings.ADMIN_IDS.split(",") if x.strip().isdigit()
-    }
+def _admin_ids() -> set[int]:
+    return {int(x) for x in settings.ADMIN_IDS.split(",") if x.strip().isdigit()}
 
 
 async def process_message(event: events.NewMessage.Event) -> None:
     """Handle incoming private messages on the Telethon user account."""
-    # Only respond to incoming private (1-on-1) messages
-    if not event.is_private:
-        return
-    # Skip outgoing messages (our own)
-    if event.out:
-        return
-
-    sender_id = event.sender_id
-    if sender_id is None:
-        return
-
-    # Skip admin users — they control the system
-    if _is_admin(sender_id):
-        return
-
-    text = (event.message.text or "").strip()
-    if not text:
-        return
-
     try:
+        sender_id = event.sender_id
+        if sender_id is None:
+            return
+
+        # Skip admin users
+        if sender_id in _admin_ids():
+            return
+
+        text = (event.message.text or "").strip()
+        if not text:
+            return
+
+        logger.info("AI DM received from user %d: %r", sender_id, text[:60])
+
         sender = await event.get_sender()
         user_name = getattr(sender, "first_name", "") or ""
 
-        # Show typing indicator while Groq thinks
+        # Show typing indicator
         async with event.client.action(event.chat_id, "typing"):
             reply = await chat(sender_id, text, user_name=user_name)
 
         if reply:
             await event.reply(reply)
-            logger.info("AI replied to Telethon user %d", sender_id)
+            logger.info("AI replied to user %d (%d chars)", sender_id, len(reply))
+        else:
+            # Fallback — confirms handler is working even if Groq fails
+            logger.warning("Groq returned empty reply for user %d — using fallback", sender_id)
+            greeting = f"سلام {user_name}! 👋" if user_name else "سلام! 👋"
+            await event.reply(greeting)
 
     except Exception as exc:
-        logger.error("Telethon AI handler error for user %d: %s", sender_id, exc)
+        logger.error("Telethon AI handler error: %s", exc, exc_info=True)
+
+
+def register(tg_service) -> None:
+    """Register this handler directly on the Telethon client with proper filters.
+
+    Uses incoming=True + is_private filter so we ONLY react to messages
+    sent TO this account (not our own outgoing messages, not group messages).
+    """
+    tg_service.client.add_event_handler(
+        process_message,
+        events.NewMessage(
+            incoming=True,
+            func=lambda e: e.is_private,
+        ),
+    )
+    logger.info("Telethon AI private-DM handler registered")
