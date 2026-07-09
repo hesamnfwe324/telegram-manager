@@ -116,6 +116,7 @@ class BroadcastQueueService:
         self._jobs: dict[str, BroadcastJob] = {}
         self._active: bool = False
         self._task: asyncio.Task | None = None
+        self._manually_cancelled: bool = False
 
     @classmethod
     def get_instance(cls) -> "BroadcastQueueService":
@@ -137,6 +138,7 @@ class BroadcastQueueService:
 
     def cancel_active(self) -> bool:
         if self._task and not self._task.done():
+            self._manually_cancelled = True
             self._task.cancel()
             logger.warning("BroadcastQueueService: active task cancelled by admin")
             return True
@@ -197,8 +199,12 @@ class BroadcastQueueService:
             )
             await asyncio.wait_for(coro, timeout=_MAX_BROADCAST_SECONDS)
         except asyncio.CancelledError:
-            job.error = "cancelled by admin"
-            logger.warning("Broadcast job %s cancelled", job.job_id)
+            if self._manually_cancelled:
+                job.error = "cancelled by admin"
+                logger.warning("Broadcast job %s cancelled by admin", job.job_id)
+            else:
+                job.error = "service restarted"
+                logger.warning("Broadcast job %s interrupted by service restart", job.job_id)
         except asyncio.TimeoutError:
             job.error = f"timed out after {_MAX_BROADCAST_SECONDS}s"
             logger.error("Broadcast job %s timed out", job.job_id)
@@ -209,6 +215,7 @@ class BroadcastQueueService:
             job.done = True
             self._active = False
             self._task = None
+            self._manually_cancelled = False
             self._prune_old_jobs()
             await self._report(job)
 
@@ -676,7 +683,9 @@ class BroadcastQueueService:
         try:
             target_fa = "گروه‌ها" if job.target == "groups" else "کاربران"
             if job.error == "cancelled by admin":
-                status = "🛑 لغو شد"
+                status = "🛑 لغو شد توسط ادمین"
+            elif job.error == "service restarted":
+                status = "⚠️ قطع شد (ری‌استارت سرویس)"
             elif job.error:
                 status = "❌ با خطا متوقف شد"
             else:
