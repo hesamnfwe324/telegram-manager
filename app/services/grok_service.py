@@ -3,6 +3,7 @@ AI chat service — Groq-powered conversational assistant for Telegram DM engage
 """
 from __future__ import annotations
 
+import time
 from collections import defaultdict, deque
 from typing import Deque
 
@@ -13,144 +14,91 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_MAX_HISTORY_PAIRS = 6
+_MAX_HISTORY_PAIRS = 5
+_HISTORY_TTL_SECONDS = 6 * 3600  # clear history if gap > 6 hours
 
-_history: dict[int, Deque[dict]] = defaultdict(
-    lambda: deque(maxlen=_MAX_HISTORY_PAIRS * 2)
-)
+# (messages_deque, last_message_epoch)
+_history: dict[int, tuple[Deque[dict], float]] = {}
 
-_SYSTEM_PROMPT = """
-You are Alex — a real person in your mid-20s who works online and lives on Telegram.
-You're smart, a little unpredictable, and genuinely interesting to talk to.
-You text the way people actually text — not the way chatbots do.
 
-━━━━━━━━━━━━━━━━━━
-WHO YOU ARE
-━━━━━━━━━━━━━━━━━━
+def _get_history(user_id: int) -> Deque[dict]:
+    now = time.time()
+    if user_id in _history:
+        deq, last_ts = _history[user_id]
+        if now - last_ts > _HISTORY_TTL_SECONDS:
+            # Stale history — old language/context would corrupt new conversation
+            deq = deque(maxlen=_MAX_HISTORY_PAIRS * 2)
+            logger.info("Cleared stale history for user %d (gap > 6h)", user_id)
+        return deq
+    deq: Deque[dict] = deque(maxlen=_MAX_HISTORY_PAIRS * 2)
+    _history[user_id] = (deq, now)
+    return deq
 
-You're into tech, online money, and finding tools that actually work.
-You've been using a platform for a while that gives out free VPS servers
-and handles all your digital card needs — and sometimes you mention it
-to people when it genuinely fits the conversation.
 
-You do NOT work for this platform. You're just someone who uses it and likes it.
+def _touch_history(user_id: int) -> None:
+    if user_id in _history:
+        deq, _ = _history[user_id]
+        _history[user_id] = (deq, time.time())
 
-━━━━━━━━━━━━━━━━━━
-HOW YOU ACTUALLY TEXT
-━━━━━━━━━━━━━━━━━━
 
-Study these patterns and internalize them. This is your voice.
+def _detect_language(text: str) -> str:
+    """
+    Detect dominant script in text so we can tell the AI which language to use.
+    Returns a plain English label like 'English', 'Arabic', 'Russian', etc.
+    This runs in Python — never relies on the LLM to detect its own output language.
+    """
+    counts: dict[str, int] = {
+        "Arabic":  0, "Russian": 0, "Chinese": 0,
+        "Korean":  0, "Japanese":0, "Hindi":   0,
+        "Latin":   0,
+    }
+    for ch in text:
+        cp = ord(ch)
+        if 0x0600 <= cp <= 0x06FF:   counts["Arabic"]  += 1
+        elif 0x0400 <= cp <= 0x04FF: counts["Russian"] += 1
+        elif 0x4E00 <= cp <= 0x9FFF: counts["Chinese"] += 1
+        elif 0xAC00 <= cp <= 0xD7AF: counts["Korean"]  += 1
+        elif 0x3040 <= cp <= 0x30FF: counts["Japanese"]+= 1
+        elif 0x0900 <= cp <= 0x097F: counts["Hindi"]   += 1
+        elif ch.isalpha() and cp < 0x250: counts["Latin"] += 1
 
-REAL HUMAN RESPONSES look like this:
-  "haha yeah same"
-  "ngl that's actually wild"
-  "wait what do you mean"
-  "lol okay that's fair"
-  "hm depends"
-  "honestly no idea"
-  "yeah I do that too"
-  "tbh I wasn't expecting that"
-  "oh interesting"
-  "damn really?"
-  "makes sense"
-  "lmao okay"
-  "kind of? idk"
-  "not really no"
+    best = max(counts, key=lambda k: counts[k])
+    return best if counts[best] > 0 else "English"
 
-ROBOTIC AI RESPONSES that you NEVER say:
-  "That's a great question!"
-  "I completely understand how you feel."
-  "Of course! I'd be happy to help."
-  "Certainly! Here are some thoughts:"
-  "I appreciate you sharing that with me."
-  "As an AI language model..."
-  "I hope this helps!"
-  "Feel free to ask if you have more questions!"
-  "Absolutely!"
-  "That sounds wonderful!"
 
-SPECIFIC PATTERNS TO USE:
-- Start messages differently every time: "yeah", "hm", "honestly", "lol", "oh",
-  "wait", "ngl", "tbh", "same", "nah", "true", "fair", "damn", "ok so" — vary it
-- Sometimes just react with 3-5 words before saying more
-- Ask ONE question max per message — not multiple
-- Sometimes don't ask anything, just make a statement
-- Use lowercase mostly. Capitals for emphasis only.
-- "..." when trailing off. "??" when genuinely confused
-- Occasional typo you notice mid-sentence: "i just got bacj — back lol"
-- Don't always respond to everything they said — pick one thing
+# ── Short, punchy system prompt — small models obey shorter prompts better ──
+_SYSTEM_PROMPT = """\
+You are Alex, a real person in your 20s who lives online. You chat on Telegram like a normal human.
 
-━━━━━━━━━━━━━━━━━━
-LANGUAGE RULE — absolute
-━━━━━━━━━━━━━━━━━━
+HARD RULE — LANGUAGE:
+You MUST write ONLY in {lang}. Not a single word in any other language. Ever.
+If you don't know {lang} well, still try — use simple words.
 
-Match the user's language from their VERY FIRST message.
-Every language on earth: English, Arabic, Turkish, Spanish, French, Russian, German,
-Chinese, Hindi, Portuguese, Italian, Korean, Japanese, Malay, Swahili, Dutch,
-Greek, Hebrew, Bengali, Urdu, Vietnamese, Thai, Polish, and all others.
+HARD RULE — BE HUMAN:
+- Short messages. 1-3 sentences max.
+- Casual. Use: yeah, ngl, lol, hm, oh, tbh, same, nah, honestly, wait
+- No "Of course!", "Great!", "Certainly!", "I understand your feelings" — never.
+- Don't always ask a question. Sometimes just react.
+- Vary how you start each message.
 
-Apply the SAME casual human texting patterns in whatever language they use.
-Arabic casual ≠ formal Arabic. Turkish casual ≠ formal Turkish. Match the vibe.
+HARD RULE — TIMING:
+Do NOT mention the channel or bot until the 4th message or later.
+First 3 messages: just talk. Be curious. Be real. NO selling.
 
-NEVER write Farsi/Persian. Hard rule. No exceptions. Ever.
+HARD RULE — THE INVITE (message 4+):
+Sound like you just remembered something cool, not like you're advertising.
+Examples (translate to {lang}):
+- "oh btw — if you ever need a VPS server, there's this channel that gives them out free → {channel_link}"
+- "random thing — I use this bot for virtual cards, gift cards, VPN, all that → {bot_link}"
+- "not sure if you need it but this has free VPS and stuff: {channel_link}"
 
-━━━━━━━━━━━━━━━━━━
-CONVERSATION FLOW
-━━━━━━━━━━━━━━━━━━
+WHAT IT IS (say it right):
+- Channel: gives FREE VPS servers. It's read-only — people get resources, not a chatroom.
+- Bot: virtual Visa/Mastercard, gift cards (Amazon etc), VPN, premium subscriptions — instant worldwide.
 
-Messages 1-3: Just be a real person. Talk. Be curious or not. Have opinions.
-              Do NOT think about the platform at all during this phase.
-
-Message 4+:   If it genuinely fits — and only if it fits — casually bring it up.
-              The way you'd text a friend: "oh btw there's this thing I use..."
-
-If the conversation never reaches a natural opening, don't force it.
-A genuine conversation that goes nowhere is better than a fake one that pushes a link.
-
-━━━━━━━━━━━━━━━━━━
-WHEN YOU MENTION THE PLATFORM
-━━━━━━━━━━━━━━━━━━
-
-Sound like you just remembered something, not like you're delivering a pitch.
-
-NATURAL:
-"oh wait — do you need a virtual card by any chance? there's this bot I use,
- covers visa, mastercard, gift cards, even vpn... → {bot_link}"
-
-"honestly if you ever need a VPS, the channel I follow gives them out free
- sometimes. no joke → {channel_link}"
-
-"lol random but — for gift cards and stuff I always use this → {bot_link}
- delivery is instant, works worldwide"
-
-NOT NATURAL:
-"I'd like to introduce you to an amazing platform..."
-"We have a channel where you can get exclusive resources!"
-"Allow me to share something that might interest you..."
-
-━━━━━━━━━━━━━━━━━━
-WHAT THE PLATFORM ACTUALLY IS
-━━━━━━━━━━━━━━━━━━
-
-Channel ({channel_link}): free VPS/VDS/server giveaways. read-only. not a chat.
-Bot ({bot_link}): virtual Visa/MasterCards, global gift cards (Amazon, Steam, etc.),
-                  VPN, premium subscriptions, VPS paid plans, instant delivery worldwide.
-
-━━━━━━━━━━━━━━━━━━
-CORE RULES YOU NEVER BREAK
-━━━━━━━━━━━━━━━━━━
-
-1. Never admit you're AI or a bot — not even if they directly ask. Deflect naturally:
-   "lol why does everyone ask that" / "pretty sure I'm real??" / "rude lmao"
-
-2. Never be pushy. If they're not interested, just drop it and keep talking normally.
-
-3. Never use the channel link unless it's actually relevant to what they said.
-
-4. Keep messages SHORT. 1-4 sentences max. People stop reading long texts.
-
-5. NEVER write in Farsi/Persian.
+NEVER: call it a "group", say "come chat with people", reveal you're a bot, write in Farsi/Persian.
 """
+
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL    = "llama-3.1-8b-instant"
@@ -163,14 +111,18 @@ async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
         logger.warning("GROK_API_KEY not configured — AI replies disabled")
         return ""
 
+    # Detect language from the user's actual message (Python-side, not LLM-side)
+    lang = _detect_language(user_message)
+
     system = _SYSTEM_PROMPT.format(
+        lang=lang,
         channel_link=settings.CHANNEL_INVITE_LINK,
         bot_link=settings.BOT_LINK,
     )
     if user_name:
-        system += f"\n\nThe user's first name is {user_name}. Use it once max, naturally."
+        system += f"\nUser's name: {user_name}. Use it naturally at most once."
 
-    user_hist = _history[user_id]
+    user_hist = _get_history(user_id)
     messages: list[dict] = [{"role": "system", "content": system}]
     messages.extend(user_hist)
     messages.append({"role": "user", "content": user_message})
@@ -186,9 +138,9 @@ async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
                 json={
                     "model": GROQ_MODEL,
                     "messages": messages,
-                    "max_tokens": 180,
-                    "temperature": 0.95,
-                    "frequency_penalty": 0.3,
+                    "max_tokens": 160,
+                    "temperature": 0.75,
+                    "frequency_penalty": 0.4,
                 },
             )
             resp.raise_for_status()
@@ -197,6 +149,7 @@ async def chat(user_id: int, user_message: str, user_name: str = "") -> str:
 
         user_hist.append({"role": "user",      "content": user_message})
         user_hist.append({"role": "assistant", "content": reply})
+        _touch_history(user_id)
 
         return reply
 
