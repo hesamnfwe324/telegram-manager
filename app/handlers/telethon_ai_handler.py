@@ -50,7 +50,7 @@ async def process_message(event: events.NewMessage.Event) -> None:
 
 
 async def _reply(event: events.NewMessage.Event, sender_id: int, text: str) -> None:
-    """Background task: call Groq and send the reply."""
+    """Background task: call Groq and send the reply threaded to the original message."""
     try:
         sender = await event.get_sender()
         user_name = getattr(sender, "first_name", "") or ""
@@ -61,11 +61,11 @@ async def _reply(event: events.NewMessage.Event, sender_id: int, text: str) -> N
         reply = await chat(sender_id, text, user_name=user_name)
 
         if reply:
+            # reply() threads the response to the user's exact message
             await event.reply(reply)
             logger.info("AI replied to user %d (%d chars)", sender_id, len(reply))
         else:
-            greeting = f"سلام {user_name}! 👋" if user_name else "سلام! 👋"
-            await event.reply(greeting)
+            logger.warning("AI returned empty reply for user %d — skipping", sender_id)
 
     except Exception as exc:
         logger.error("AI _reply error for user %d: %s", sender_id, exc, exc_info=True)
