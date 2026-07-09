@@ -167,20 +167,22 @@ class TelegramUserService:
             return
         await self.client.connect()
 
-          # Skip group catch-up backlog — reset update state to NOW so Telethon
-          # only fetches real-time updates, not thousands of missed group messages.
-          try:
-              from telethon.tl.functions.updates import GetStateRequest
-              _cur_state = await self.client(GetStateRequest())
-              self.client.session.set_update_state(0, _cur_state)
-              logger.info(
-                  "Telethon update state reset (pts=%d) — group catch-up skipped",
-                  _cur_state.pts,
-              )
-          except Exception as _ue:
-              logger.warning("Could not reset Telethon update state: %s", _ue)
+        # Skip group catch-up backlog on reconnect.
+        # Accounts in many groups accumulate missed updates that flood Telethon's
+        # queue and delay private-message events by minutes. Setting pts/date to
+        # the current server state means: only process updates from NOW onwards.
+        try:
+            from telethon.tl.functions.updates import GetStateRequest
+            _cur_state = await self.client(GetStateRequest())
+            self.client.session.set_update_state(0, _cur_state)
+            logger.info(
+                "Telethon update state reset (pts=%d) — group catch-up skipped",
+                _cur_state.pts,
+            )
+        except Exception as _ue:
+            logger.warning("Could not reset Telethon update state: %s", _ue)
 
-          if not await self.client.is_user_authorized():
+        if not await self.client.is_user_authorized():
             logger.warning("Telegram session not authorized — interactive login required")
             raise RuntimeError(
                 "Telegram session is not authorized. "
